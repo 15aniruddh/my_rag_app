@@ -159,9 +159,12 @@ jobs:
             --server-side-encryption-configuration \
             '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
 
-      - name: Ensure Origin Access Control
+      - name: Ensure Origin Access Controls
         id: oac
         run: |
+          # Two OACs: one signs S3 reads, one signs Lambda invocations. The
+          # Lambda one is what makes an AWS_IAM Function URL reachable, without
+          # the URL being public.
           NAME="${PROJECT}-oac"
           ID=$(aws cloudfront list-origin-access-controls \
                  --query "OriginAccessControlList.Items[?Name=='${NAME}'].Id | [0]" \
@@ -177,6 +180,22 @@ jobs:
               --query 'OriginAccessControl.Id' --output text)
           fi
           echo "id=$ID" >> "$GITHUB_OUTPUT"
+
+          LNAME="${PROJECT}-oac-lambda"
+          LID=$(aws cloudfront list-origin-access-controls \
+                  --query "OriginAccessControlList.Items[?Name=='${LNAME}'].Id | [0]" \
+                  --output text 2>/dev/null || echo "None")
+          if [ "$LID" = "None" ] || [ -z "$LID" ]; then
+            LID=$(aws cloudfront create-origin-access-control \
+              --origin-access-control-config "{
+                \"Name\":\"${LNAME}\",
+                \"Description\":\"OAC for ${PROJECT} lambda function url\",
+                \"SigningProtocol\":\"sigv4\",
+                \"SigningBehavior\":\"always\",
+                \"OriginAccessControlOriginType\":\"lambda\"}" \
+              --query 'OriginAccessControl.Id' --output text)
+          fi
+          echo "lambda_id=$LID" >> "$GITHUB_OUTPUT"
 
       - name: Ensure CloudFront distribution
         id: cf
@@ -226,6 +245,7 @@ jobs:
                 {
                   "Id": "lambda-api",
                   "DomainName": "${{ needs.preflight.outputs.host }}",
+                  "OriginAccessControlId": "${{ steps.oac.outputs.lambda_id }}",
                   "CustomOriginConfig": {
                     "HTTPPort": 80,
                     "HTTPSPort": 443,
@@ -292,6 +312,22 @@ jobs:
           echo "domain=$DOMAIN"   >> "$GITHUB_OUTPUT"
           echo "arn=$ARN"         >> "$GITHUB_OUTPUT"
           echo "url=https://$DOMAIN" >> "$GITHUB_OUTPUT"
+
+      - name: Grant CloudFront permission to invoke the Lambda
+        # Scoped to this distribution's ARN, so only it can reach the Function
+        # URL. Re-applied every run because the statement is idempotent only by
+        # id - remove first, then add.
+        run: |
+          FN="${PROJECT}-api"
+          aws lambda remove-permission --function-name "$FN" \
+            --statement-id AllowCloudFrontInvoke >/dev/null 2>&1 || true
+          aws lambda add-permission --function-name "$FN" \
+            --statement-id AllowCloudFrontInvoke \
+            --action lambda:InvokeFunctionUrl \
+            --principal cloudfront.amazonaws.com \
+            --source-arn "${{ steps.cf.outputs.arn }}" \
+            --function-url-auth-type AWS_IAM >/dev/null
+          echo "CloudFront may now invoke $FN"
 
       - name: Grant CloudFront read access to the bucket
         # Done after the distribution exists, because the policy is scoped to

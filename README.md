@@ -394,10 +394,23 @@ asset names immediately. Every deploy invalidates `/*`.
 > failing silently — if it times out, the site is usually fine a few minutes
 > later. Subsequent deploys are quick.
 
-The Function URL stays publicly reachable, so the API can be called directly,
-bypassing CloudFront. Rate limiting is enforced in the application, so it still
-applies. `backend.yml` sets `ALLOWED_ORIGINS` to the CloudFront domain for that
-case; it is empty on the very first run, before the distribution exists.
+The Function URL uses **`AWS_IAM` auth, not `NONE`**, so it cannot be called
+anonymously. CloudFront reaches it through a second Origin Access Control (type
+`lambda`) that signs each request with SigV4, and the function's resource policy
+allows only `cloudfront.amazonaws.com` scoped to this distribution's ARN.
+
+Two reasons for that:
+
+1. **It is more secure.** The API is reachable only through CloudFront, so
+   nobody can bypass the site and hit the Lambda directly.
+2. **Anonymous Function URLs are refused in some accounts.** A URL with
+   `AuthType: NONE` and a textbook-correct `Principal: "*"` resource policy can
+   still return `403 Forbidden` on every path, with no SCP and no explanatory
+   API. Requiring SigV4 avoids the problem entirely.
+
+Because the URL requires signing, `backend.yml` smoke-tests the function with
+`aws lambda invoke` rather than curl. That still exercises the real handler,
+dependencies and environment.
 
 ### Cost
 
@@ -458,6 +471,8 @@ Notes worth knowing:
 | `frontend.yml` fails on "function URL not found" | Run `backend.yml` first; the frontend needs it as a CloudFront origin. |
 | Smoke test times out on the first frontend deploy | A new distribution needs 5-15 minutes to propagate. Check the URL again shortly. |
 | Site returns 403 from CloudFront | The bucket policy step did not run, or the OAC is not attached. Re-run the workflow. |
+| Function URL returns 403 directly | Expected. It uses `AWS_IAM` auth and is reachable only through CloudFront. Test with `aws lambda invoke`. |
+| `/api/*` returns 403 through CloudFront | The Lambda OAC or the `AllowCloudFrontInvoke` permission is missing. Re-run `frontend.yml`. |
 | `Not authorized to perform sts:AssumeRoleWithWebIdentity` | The trust policy's `sub` pattern does not match the token. See the note under **One-time AWS setup**. |
 | Build fails: "exceeds Lambda's 250MB limit" | A new dependency pushed the package over. See **The 250MB problem**. |
 | First request after idle is slow | Cold start pulls the 59MB model from S3 into `/tmp`. Subsequent calls are warm. |

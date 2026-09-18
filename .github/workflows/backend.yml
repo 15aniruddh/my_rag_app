@@ -237,34 +237,67 @@ jobs:
         id: url
         run: |
           FN="${PROJECT}-api"
-          aws lambda get-function-url-config --function-name "$FN" >/dev/null 2>&1 || {
+
+          # AWS_IAM, not NONE. Anonymous invocation of Function URLs is refused
+          # in this account (403 on every path despite a correct NONE policy),
+          # and requiring SigV4 is the better design anyway: the URL is not
+          # reachable directly, only through CloudFront, which signs requests
+          # with an Origin Access Control. frontend.yml grants that access.
+          if aws lambda get-function-url-config --function-name "$FN" >/dev/null 2>&1; then
+            CURRENT=$(aws lambda get-function-url-config --function-name "$FN" \
+                        --query AuthType --output text)
+            if [ "$CURRENT" != "AWS_IAM" ]; then
+              echo "switching auth type from ${CURRENT} to AWS_IAM"
+              aws lambda update-function-url-config --function-name "$FN" \
+                --auth-type AWS_IAM >/dev/null
+            fi
+          else
             aws lambda create-function-url-config --function-name "$FN" \
-              --auth-type NONE >/dev/null
-            # Without this the URL returns 403: the URL itself is not enough,
-            # the function policy must allow public invocation.
-            aws lambda add-permission --function-name "$FN" \
-              --statement-id FunctionURLAllowPublicAccess \
-              --action lambda:InvokeFunctionUrl \
-              --principal '*' --function-url-auth-type NONE >/dev/null
-          }
+              --auth-type AWS_IAM >/dev/null
+          fi
+
+          # Drop the public-invoke statement if an earlier deploy added one.
+          aws lambda remove-permission --function-name "$FN" \
+            --statement-id FunctionURLAllowPublicAccess >/dev/null 2>&1 || true
+
           URL=$(aws lambda get-function-url-config --function-name "$FN" \
                   --query FunctionUrl --output text)
           echo "function_url=$URL" >> "$GITHUB_OUTPUT"
-          echo "function url: $URL"
+          echo "function url: $URL (AWS_IAM - reachable only via CloudFront)"
 
       - name: Smoke test
         run: |
-          URL="${{ steps.url.outputs.function_url }}"
-          for i in $(seq 1 20); do
-            code=$(curl -s -o /tmp/health.json -w "%{http_code}" --max-time 30 "${URL}api/health" || true)
-            if [ "$code" = "200" ]; then
-              echo "healthy:"; cat /tmp/health.json; echo; exit 0
+          FN="${PROJECT}-api"
+          # Invoke directly rather than curling the URL: it now requires SigV4,
+          # and CloudFront (which holds the signing credentials) is created by
+          # the frontend workflow. This still exercises the real handler, the
+          # real dependencies and the real environment.
+          cat > /tmp/event.json <<'JSON'
+          {"version":"2.0","rawPath":"/api/health","rawQueryString":"",
+           "headers":{"host":"probe.lambda-url.on.aws","accept":"*/*"},
+           "requestContext":{"http":{"method":"GET","path":"/api/health",
+             "protocol":"HTTP/1.1","sourceIp":"127.0.0.1"},
+             "stage":"$default","requestId":"smoke","apiId":"probe",
+             "domainName":"probe","accountId":"0","time":"x","timeEpoch":0},
+           "isBase64Encoded":false}
+          JSON
+
+          for i in $(seq 1 10); do
+            if aws lambda invoke --function-name "$FN" \
+                 --cli-binary-format raw-in-base64-out \
+                 --payload file:///tmp/event.json /tmp/out.json >/tmp/meta.json 2>&1; then
+              if grep -q '"statusCode": 200' /tmp/out.json; then
+                echo "handler healthy:"
+                cat /tmp/out.json; echo
+                exit 0
+              fi
             fi
-            echo "  attempt $i: $code"
-            sleep 15
+            echo "  attempt $i:"; cat /tmp/out.json 2>/dev/null | head -c 400; echo
+            sleep 10
           done
-          echo "never became healthy; recent logs:"
-          aws logs tail "/aws/lambda/${PROJECT}-api" --since 10m || true
+
+          echo "::error::Lambda did not return a healthy response"
+          aws logs tail "/aws/lambda/${FN}" --since 10m 2>/dev/null || echo "(no log group yet)"
           exit 1
 
       - name: Summary
