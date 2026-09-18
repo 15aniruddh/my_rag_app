@@ -32,7 +32,7 @@ concurrency:
 
 env:
   AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
-  PROJECT: pdf-qa
+  PROJECT: rag-app
   PYTHON_VERSION: '3.13'
 
 jobs:
@@ -117,13 +117,15 @@ jobs:
         id: upload
         run: |
           BUCKET="${{ steps.bucket.outputs.name }}"
-          # The SHA in the key means each deploy is traceable and the previous
-          # package stays available for rollback.
-          aws s3 cp backend/lambda.zip "s3://${BUCKET}/lambda/${{ github.sha }}.zip"
-          echo "key=lambda/${{ github.sha }}.zip" >> "$GITHUB_OUTPUT"
+          # One fixed key, overwritten every deploy. A SHA-suffixed key left a
+          # 65MB zip behind on each push, which adds up fast for no benefit:
+          # rollback is better served by the git history than by stale S3
+          # objects, and Lambda keeps its own copy of the deployed package.
+          aws s3 cp backend/lambda.zip "s3://${BUCKET}/lambda/function.zip"
+          echo "key=lambda/function.zip" >> "$GITHUB_OUTPUT"
 
-          # The model rarely changes, so upload it only when absent - it is
-          # 59MB and re-uploading on every deploy wastes minutes.
+          # Fixed key as well. The model rarely changes, so it is uploaded only
+          # when absent - it is ~58MB and re-uploading each deploy wastes time.
           if aws s3api head-object --bucket "$BUCKET" --key "model/model.tar.gz" >/dev/null 2>&1; then
             echo "model already in S3"
           else
