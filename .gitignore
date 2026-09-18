@@ -8,3 +8,17 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Secrets and local state
+.env
+uploads/
+
+# Node / frontend build
+node_modules/
+frontend/dist/
+
+# Lambda build artefacts
+backend/.lambda_build/
+backend/lambda.zip
+
+# note: bare ".venv" matches at any depth, so backend/.venv is covered
