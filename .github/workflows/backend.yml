@@ -57,8 +57,12 @@ jobs:
         working-directory: backend
         # Running the real build on PRs catches a dependency that pushes the
         # package over Lambda's 250MB limit before it reaches main.
+        #
+        # fastembed is installed on the runner so the model-download step always
+        # has a working interpreter, independent of whether the cross-compiled
+        # package in .lambda_build happens to import here.
         run: |
-          pip install --quiet uv
+          pip install --quiet uv fastembed
           ./build_lambda.sh
 
   deploy:
@@ -105,7 +109,7 @@ jobs:
       - name: Build package and model
         working-directory: backend
         run: |
-          pip install --quiet uv
+          pip install --quiet uv fastembed
           ./build_lambda.sh
           ls -lh lambda.zip model.tar.gz
 

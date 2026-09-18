@@ -34,29 +34,10 @@ fi
 
 cp api.py rag.py limits.py data_loader.py vector_db.py custom_types.py lambda_handler.py "$BUILD/"
 
-echo "==> trimming"
-# hf_xet is only used for xet-backed downloads; the model comes from S3, and
-# nothing imports it (verified). onnxruntime's training/quantisation helpers
-# are not used for inference.
-rm -rf "$BUILD/hf_xet" "$BUILD"/hf_xet-*
-rm -rf "$BUILD/onnxruntime/transformers" "$BUILD/onnxruntime/tools" "$BUILD/onnxruntime/quantization"
-find "$BUILD" -type d -name "__pycache__" -prune -exec rm -rf {} + 2>/dev/null || true
-find "$BUILD" -type d -name "tests" -prune -exec rm -rf {} + 2>/dev/null || true
-find "$BUILD" -type d -name "*.dist-info" -prune -exec rm -rf {} + 2>/dev/null || true
-find "$BUILD" -type f -name "*.pyc" -delete 2>/dev/null || true
-
-(cd "$BUILD" && zip -qr "$ZIP" .)
-UNZIPPED_MB=$(du -sm "$BUILD" | cut -f1)
-echo "==> lambda.zip: $(du -h "$ZIP" | cut -f1) zipped, ${UNZIPPED_MB}MB unzipped (limit 250MB)"
-
-if [ "$UNZIPPED_MB" -gt 250 ]; then
-  echo "!! ${UNZIPPED_MB}MB exceeds Lambda's 250MB unzipped limit" >&2
-  exit 1
-fi
-
 echo "==> building the model tarball"
-# Any interpreter with fastembed produces the same cache: the files are plain
-# ONNX and JSON, not platform-specific.
+# Done BEFORE trimming, against the pristine install: the import test needs the
+# package exactly as pip produced it.
+#
 # Which interpreter can import fastembed depends on where this runs:
 #   CI (linux/x86_64): the wheels just installed into $BUILD import directly.
 #   developer Mac:     those are Linux binaries and will not import, so fall
@@ -76,8 +57,8 @@ elif python3 -c "import fastembed" >/dev/null 2>&1; then
 fi
 
 if [ -z "$BAKE_PY" ]; then
-  echo "!! no interpreter can import fastembed (tried \$BUILD, .venv, python3)" >&2
-  echo "!! run 'uv sync' in backend/ first" >&2
+  echo "!! no interpreter can import fastembed. Diagnostics:" >&2
+  PYTHONPATH="$BUILD" python3 -c "import fastembed" 2>&1 | tail -5 >&2 || true
   exit 1
 fi
 
@@ -87,6 +68,24 @@ list(TextEmbedding().embed(["warm"]))
 print("   model downloaded")
 '
 [ -n "$(ls -A "$MODEL_DIR")" ] || { echo "!! model cache empty" >&2; exit 1; }
+
+echo "==> trimming"
+# Conservative on purpose. Earlier versions also deleted *.dist-info and
+# hf_xet; dist-info removal breaks importlib.metadata.version(), which
+# fastembed calls on import. With ~60MB of headroom under the 250MB limit,
+# shaving 16MB is not worth a runtime ImportError.
+find "$BUILD" -type d -name "__pycache__" -prune -exec rm -rf {} + 2>/dev/null || true
+find "$BUILD" -type d -name "tests" -prune -exec rm -rf {} + 2>/dev/null || true
+find "$BUILD" -type f -name "*.pyc" -delete 2>/dev/null || true
+
+(cd "$BUILD" && zip -qr "$ZIP" .)
+UNZIPPED_MB=$(du -sm "$BUILD" | cut -f1)
+echo "==> lambda.zip: $(du -h "$ZIP" | cut -f1) zipped, ${UNZIPPED_MB}MB unzipped (limit 250MB)"
+
+if [ "$UNZIPPED_MB" -gt 250 ]; then
+  echo "!! ${UNZIPPED_MB}MB exceeds Lambda's 250MB unzipped limit" >&2
+  exit 1
+fi
 
 tar -czf "$MODEL_TGZ" -C "$MODEL_DIR" .
 echo "==> model.tar.gz: $(du -h "$MODEL_TGZ" | cut -f1)"
