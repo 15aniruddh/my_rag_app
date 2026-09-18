@@ -194,18 +194,19 @@ only runs when its own directory changed.
 
 | Workflow | Triggered by | Deploys to |
 |---|---|---|
-| `.github/workflows/backend.yml` | `backend/**` | Lambda + Function URL |
+| `.github/workflows/backend.yml` | `backend/**` | Lambda + API Gateway |
 | `.github/workflows/frontend.yml` | `frontend/**` | S3 (private) + CloudFront |
 
-Both are idempotent — they create the buckets, IAM role, Lambda, Function URL,
+Both are idempotent — they create the buckets, IAM role, Lambda, HTTP API,
 Origin Access Control and CloudFront distribution if missing, and update them
 otherwise. There is no separate bootstrap step and no Terraform state to manage.
 
 ```
                     CloudFront (https)
                    /                  \
-        /  ──> S3 bucket          /api/*  ──> Lambda Function URL
-              (private, OAC)                  (FastAPI via Mangum)
+        /  ──> S3 bucket          /api/*  ──> API Gateway ──> Lambda
+              (private, OAC)                   (HTTP API)     (FastAPI
+                                                               via Mangum)
 ```
 
 Serving the API through the same distribution means the browser sees **one
@@ -304,13 +305,13 @@ gh secret set GEMINI_API_KEY --body "$(grep ^GEMINI_API_KEY .env | cut -d= -f2- 
 
 ### Ordering is automatic
 
-`frontend.yml` needs the Lambda Function URL as a CloudFront origin, so the
+`frontend.yml` needs the API Gateway endpoint as a CloudFront origin, so the
 backend must deploy first. That is handled for you:
 
 ```
 push to main
    |
-   +--> Backend   (backend/** changed)  -> Lambda + Function URL
+   +--> Backend   (backend/** changed)  -> Lambda + API Gateway
    |        |
    |        +-- on success, triggers ------> Frontend -> S3 + CloudFront
    |
@@ -376,11 +377,11 @@ The distribution carries two origins:
 | Path | Origin | Caching |
 |---|---|---|
 | `/*` | S3 bucket | `Managed-CachingOptimized` |
-| `/api/*` | Lambda Function URL | `Managed-CachingDisabled` |
+| `/api/*` | API Gateway HTTP API | `Managed-CachingDisabled` |
 
 `/api/*` also uses the `Managed-AllViewerExceptHostHeader` origin request
-policy. That detail matters: a Lambda Function URL **rejects requests carrying
-CloudFront's `Host` header**, so that one header must not be forwarded.
+policy. That detail matters: the origin **must not receive CloudFront's `Host`
+header**, or API Gateway cannot match the request to its API.
 
 `403` and `404` both return `/index.html` with a `200`, so client-side routes
 resolve instead of hitting an S3 error.
@@ -394,23 +395,26 @@ asset names immediately. Every deploy invalidates `/*`.
 > failing silently — if it times out, the site is usually fine a few minutes
 > later. Subsequent deploys are quick.
 
-The Function URL uses **`AWS_IAM` auth, not `NONE`**, so it cannot be called
-anonymously. CloudFront reaches it through a second Origin Access Control (type
-`lambda`) that signs each request with SigV4, and the function's resource policy
-allows only `cloudfront.amazonaws.com` scoped to this distribution's ARN.
+`/api/*` is served by an **API Gateway HTTP API** in front of the Lambda, not by
+a Lambda Function URL.
 
-Two reasons for that:
+> **Why not a Function URL?** It is the simpler design and it is what this
+> project used first, but Function URLs returned `403 Forbidden` for every
+> caller in this AWS account — in **both** `AuthType: NONE` (with a correct
+> `Principal: "*"` resource policy) and `AWS_IAM` (with a CloudFront Origin
+> Access Control). The request never reached the function: no CloudWatch logs
+> were produced at all. There was no SCP, no organization, and no
+> public-access-block API to explain it. API Gateway invokes the Lambda over a
+> different path and worked on the first attempt.
 
-1. **It is more secure.** The API is reachable only through CloudFront, so
-   nobody can bypass the site and hit the Lambda directly.
-2. **Anonymous Function URLs are refused in some accounts.** A URL with
-   `AuthType: NONE` and a textbook-correct `Principal: "*"` resource policy can
-   still return `403 Forbidden` on every path, with no SCP and no explanatory
-   API. Requiring SigV4 avoids the problem entirely.
+API Gateway's free tier is 1M calls for 12 months, then about $1 per million —
+pennies at this traffic.
 
-Because the URL requires signing, `backend.yml` smoke-tests the function with
-`aws lambda invoke` rather than curl. That still exercises the real handler,
-dependencies and environment.
+The distribution has **no `CustomErrorResponses`**. An earlier version mapped
+403/404 to `/index.html` for single-page-app routing, but those rules apply
+distribution-wide, so an API error came back as the HTML page with status 200
+and hid the real failure. This app has no client-side routes, so the rules were
+never needed.
 
 ### Cost
 
@@ -435,7 +439,8 @@ Notes worth knowing:
 - **Uploads are ephemeral.** `api.py` writes to the system temp dir (`/tmp` on
   Lambda, the only writable path there) and deletes in a `finally`, so a failed
   ingest still cleans up.
-- **6MB upload cap.** Lambda Function URLs limit request payloads to about 6MB;
+- **10MB upload cap.** API Gateway limits request payloads to 10MB (the API
+  still enforces 6MB);
   larger PDFs get a clear 413. For bigger files, upload to S3 with a presigned
   PUT and have the Lambda read from there.
 - **Re-ingesting the same PDF is safe.** Point IDs are `uuid5(source_id + chunk
@@ -471,8 +476,9 @@ Notes worth knowing:
 | `frontend.yml` fails on "function URL not found" | Run `backend.yml` first; the frontend needs it as a CloudFront origin. |
 | Smoke test times out on the first frontend deploy | A new distribution needs 5-15 minutes to propagate. Check the URL again shortly. |
 | Site returns 403 from CloudFront | The bucket policy step did not run, or the OAC is not attached. Re-run the workflow. |
-| Function URL returns 403 directly | Expected. It uses `AWS_IAM` auth and is reachable only through CloudFront. Test with `aws lambda invoke`. |
-| `/api/*` returns 403 through CloudFront | The Lambda OAC or the `AllowCloudFrontInvoke` permission is missing. Re-run `frontend.yml`. |
+| `/api/*` returns 403 through CloudFront | API Gateway cannot invoke the Lambda. Check the `AllowAPIGatewayInvoke` permission; re-run `backend.yml`. |
+| `/api/*` returns the HTML page instead of JSON | `CustomErrorResponses` are rewriting API errors. They should be `Quantity: 0`. |
+| Lambda Function URL returns 403 | Known in this account; that is why the deployment uses API Gateway instead. |
 | `Not authorized to perform sts:AssumeRoleWithWebIdentity` | The trust policy's `sub` pattern does not match the token. See the note under **One-time AWS setup**. |
 | Build fails: "exceeds Lambda's 250MB limit" | A new dependency pushed the package over. See **The 250MB problem**. |
 | First request after idle is slow | Cold start pulls the 59MB model from S3 into `/tmp`. Subsequent calls are warm. |

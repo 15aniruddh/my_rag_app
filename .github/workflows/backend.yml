@@ -7,7 +7,7 @@ name: Backend
 # Both are staged in S3; the function pulls the model into /tmp on cold start.
 #
 # The job is idempotent: it creates the artifacts bucket, IAM role, Lambda
-# function and Function URL if missing, and updates them otherwise.
+# function and HTTP API if missing, and updates them otherwise.
 
 on:
   push:
@@ -164,9 +164,9 @@ jobs:
         run: |
           # The site is served through CloudFront, and /api/* is routed through
           # the same distribution - so browser traffic is same-origin and CORS
-          # never fires. This is only for callers hitting the Function URL
-          # directly. Empty on the very first deploy, when the distribution
-          # does not exist yet; the frontend workflow creates it.
+          # never fires. This is only for callers hitting the API Gateway
+          # endpoint directly. Empty on the very first deploy, when the
+          # distribution does not exist yet; the frontend workflow creates it.
           DOMAIN=$(aws cloudfront list-distributions \
             --query "DistributionList.Items[?Comment=='${PROJECT} site and api'].DomainName | [0]" \
             --output text 2>/dev/null || echo "None")
@@ -233,71 +233,75 @@ jobs:
           aws logs put-retention-policy --log-group-name "/aws/lambda/${FN}" \
             --retention-in-days 14 2>/dev/null || true
 
-      - name: Ensure Function URL
+      - name: Ensure API Gateway
         id: url
         run: |
           FN="${PROJECT}-api"
+          API_NAME="${PROJECT}-http-api"
+          ACCT=$(aws sts get-caller-identity --query Account --output text)
+          FN_ARN=$(aws lambda get-function --function-name "$FN" \
+                     --query 'Configuration.FunctionArn' --output text)
 
-          # AWS_IAM, not NONE. Anonymous invocation of Function URLs is refused
-          # in this account (403 on every path despite a correct NONE policy),
-          # and requiring SigV4 is the better design anyway: the URL is not
-          # reachable directly, only through CloudFront, which signs requests
-          # with an Origin Access Control. frontend.yml grants that access.
-          if aws lambda get-function-url-config --function-name "$FN" >/dev/null 2>&1; then
-            CURRENT=$(aws lambda get-function-url-config --function-name "$FN" \
-                        --query AuthType --output text)
-            if [ "$CURRENT" != "AWS_IAM" ]; then
-              echo "switching auth type from ${CURRENT} to AWS_IAM"
-              aws lambda update-function-url-config --function-name "$FN" \
-                --auth-type AWS_IAM >/dev/null
-            fi
+          # API Gateway rather than a Lambda Function URL: Function URLs in this
+          # account return 403 for every caller, in both NONE and AWS_IAM modes,
+          # with the request never reaching the function. API Gateway invokes
+          # the Lambda over a different path and is unaffected.
+          API_ID=$(aws apigatewayv2 get-apis \
+                     --query "Items[?Name=='${API_NAME}'].ApiId | [0]" \
+                     --output text 2>/dev/null || echo "None")
+
+          if [ "$API_ID" = "None" ] || [ -z "$API_ID" ]; then
+            echo "creating HTTP API"
+            # --target builds the AWS_PROXY integration, the $default route and
+            # an auto-deploying $default stage in one call.
+            API_ID=$(aws apigatewayv2 create-api \
+                       --name "$API_NAME" \
+                       --protocol-type HTTP \
+                       --target "$FN_ARN" \
+                       --query 'ApiId' --output text)
+            echo "created $API_ID"
           else
-            aws lambda create-function-url-config --function-name "$FN" \
-              --auth-type AWS_IAM >/dev/null
+            echo "reusing HTTP API $API_ID"
           fi
 
-          # Drop the public-invoke statement if an earlier deploy added one.
+          # Let API Gateway invoke the function. Scoped to this API only.
+          aws lambda remove-permission --function-name "$FN" \
+            --statement-id AllowAPIGatewayInvoke >/dev/null 2>&1 || true
+          aws lambda add-permission --function-name "$FN" \
+            --statement-id AllowAPIGatewayInvoke \
+            --action lambda:InvokeFunction \
+            --principal apigateway.amazonaws.com \
+            --source-arn "arn:aws:execute-api:${AWS_REGION}:${ACCT}:${API_ID}/*/*" >/dev/null
+
+          # The Function URL is no longer used; remove it so there is one way in.
+          aws lambda delete-function-url-config --function-name "$FN" >/dev/null 2>&1 || true
           aws lambda remove-permission --function-name "$FN" \
             --statement-id FunctionURLAllowPublicAccess >/dev/null 2>&1 || true
+          aws lambda remove-permission --function-name "$FN" \
+            --statement-id AllowCloudFrontInvoke >/dev/null 2>&1 || true
 
-          URL=$(aws lambda get-function-url-config --function-name "$FN" \
-                  --query FunctionUrl --output text)
-          echo "function_url=$URL" >> "$GITHUB_OUTPUT"
-          echo "function url: $URL (AWS_IAM - reachable only via CloudFront)"
+          ENDPOINT=$(aws apigatewayv2 get-api --api-id "$API_ID" \
+                       --query 'ApiEndpoint' --output text)
+          echo "api_id=$API_ID"         >> "$GITHUB_OUTPUT"
+          echo "function_url=$ENDPOINT" >> "$GITHUB_OUTPUT"
+          echo "endpoint: $ENDPOINT"
 
       - name: Smoke test
         run: |
-          FN="${PROJECT}-api"
-          # Invoke directly rather than curling the URL: it now requires SigV4,
-          # and CloudFront (which holds the signing credentials) is created by
-          # the frontend workflow. This still exercises the real handler, the
-          # real dependencies and the real environment.
-          cat > /tmp/event.json <<'JSON'
-          {"version":"2.0","rawPath":"/api/health","rawQueryString":"",
-           "headers":{"host":"probe.lambda-url.on.aws","accept":"*/*"},
-           "requestContext":{"http":{"method":"GET","path":"/api/health",
-             "protocol":"HTTP/1.1","sourceIp":"127.0.0.1"},
-             "stage":"$default","requestId":"smoke","apiId":"probe",
-             "domainName":"probe","accountId":"0","time":"x","timeEpoch":0},
-           "isBase64Encoded":false}
-          JSON
-
-          for i in $(seq 1 10); do
-            if aws lambda invoke --function-name "$FN" \
-                 --cli-binary-format raw-in-base64-out \
-                 --payload file:///tmp/event.json /tmp/out.json >/tmp/meta.json 2>&1; then
-              if grep -q '"statusCode": 200' /tmp/out.json; then
-                echo "handler healthy:"
-                cat /tmp/out.json; echo
-                exit 0
-              fi
+          ENDPOINT="${{ steps.url.outputs.function_url }}"
+          echo "testing ${ENDPOINT}/api/health"
+          for i in $(seq 1 15); do
+            code=$(curl -s -o /tmp/health.json -w "%{http_code}" --max-time 40 \
+                     "${ENDPOINT}/api/health" || true)
+            if [ "$code" = "200" ]; then
+              echo "healthy:"; cat /tmp/health.json; echo
+              exit 0
             fi
-            echo "  attempt $i:"; cat /tmp/out.json 2>/dev/null | head -c 400; echo
-            sleep 10
+            echo "  attempt $i: $code $(head -c 160 /tmp/health.json 2>/dev/null)"
+            sleep 15
           done
-
-          echo "::error::Lambda did not return a healthy response"
-          aws logs tail "/aws/lambda/${FN}" --since 10m 2>/dev/null || echo "(no log group yet)"
+          echo "::error::API did not become healthy"
+          aws logs tail "/aws/lambda/${PROJECT}-api" --since 10m 2>/dev/null || echo "(no log group)"
           exit 1
 
       - name: Summary
@@ -308,7 +312,7 @@ jobs:
             echo
             echo "| | |"
             echo "|---|---|"
-            echo "| Function URL | ${{ steps.url.outputs.function_url }} |"
+            echo "| API endpoint | ${{ steps.url.outputs.function_url }} |"
             echo "| Package | \`${{ steps.upload.outputs.key }}\` |"
             echo "| Region | \`${{ env.AWS_REGION }}\` |"
           } >> "$GITHUB_STEP_SUMMARY"

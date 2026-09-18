@@ -5,7 +5,7 @@ name: Frontend
 #
 # CloudFront carries two origins:
 #   /       -> S3 (private, reached via Origin Access Control)
-#   /api/*  -> the Lambda Function URL
+#   /api/*  -> API Gateway (HTTP API) -> Lambda
 #
 # Routing the API through the same distribution makes the browser see one
 # origin, so CORS never applies and VITE_API_BASE stays empty.
@@ -15,7 +15,7 @@ name: Frontend
 
 on:
   # Runs after Backend succeeds, so a single push that touches both deploys
-  # them in the right order: the frontend needs the Lambda Function URL as a
+  # them in the right order: the frontend needs the API Gateway endpoint as a
   # CloudFront origin.
   workflow_run:
     workflows: ["Backend"]
@@ -93,8 +93,12 @@ jobs:
       - name: Is the backend deployed?
         id: probe
         run: |
-          URL=$(aws lambda get-function-url-config --function-name "${PROJECT}-api" \
-                  --query FunctionUrl --output text 2>/dev/null || echo "")
+          URL=$(aws apigatewayv2 get-apis \
+                  --query "Items[?Name=='${PROJECT}-http-api'].ApiEndpoint | [0]" \
+                  --output text 2>/dev/null || echo "")
+          # if/then, not "[ ... ] && ...": under bash -e a false test makes the
+          # whole && list return 1 and aborts the step.
+          if [ "$URL" = "None" ]; then URL=""; fi
           if [ -z "$URL" ]; then
             # Not an error: on the very first push the Backend workflow is still
             # running, and its completion re-triggers this workflow. Skip
@@ -162,9 +166,8 @@ jobs:
       - name: Ensure Origin Access Controls
         id: oac
         run: |
-          # Two OACs: one signs S3 reads, one signs Lambda invocations. The
-          # Lambda one is what makes an AWS_IAM Function URL reachable, without
-          # the URL being public.
+          # Only S3 needs an OAC. API Gateway is a public HTTPS origin and
+          # CloudFront reaches it without signing.
           NAME="${PROJECT}-oac"
           ID=$(aws cloudfront list-origin-access-controls \
                  --query "OriginAccessControlList.Items[?Name=='${NAME}'].Id | [0]" \
@@ -181,21 +184,6 @@ jobs:
           fi
           echo "id=$ID" >> "$GITHUB_OUTPUT"
 
-          LNAME="${PROJECT}-oac-lambda"
-          LID=$(aws cloudfront list-origin-access-controls \
-                  --query "OriginAccessControlList.Items[?Name=='${LNAME}'].Id | [0]" \
-                  --output text 2>/dev/null || echo "None")
-          if [ "$LID" = "None" ] || [ -z "$LID" ]; then
-            LID=$(aws cloudfront create-origin-access-control \
-              --origin-access-control-config "{
-                \"Name\":\"${LNAME}\",
-                \"Description\":\"OAC for ${PROJECT} lambda function url\",
-                \"SigningProtocol\":\"sigv4\",
-                \"SigningBehavior\":\"always\",
-                \"OriginAccessControlOriginType\":\"lambda\"}" \
-              --query 'OriginAccessControl.Id' --output text)
-          fi
-          echo "lambda_id=$LID" >> "$GITHUB_OUTPUT"
 
       - name: Ensure CloudFront distribution
         id: cf
@@ -209,8 +197,8 @@ jobs:
             --query "CachePolicyList.Items[?CachePolicy.CachePolicyConfig.Name=='Managed-CachingOptimized'].CachePolicy.Id | [0]" --output text)
           CACHE_OFF=$(aws cloudfront list-cache-policies --type managed \
             --query "CachePolicyList.Items[?CachePolicy.CachePolicyConfig.Name=='Managed-CachingDisabled'].CachePolicy.Id | [0]" --output text)
-          # AllViewerExceptHostHeader: a Function URL rejects requests carrying
-          # CloudFront's Host header, so that one header must not be forwarded.
+          # AllViewerExceptHostHeader: the origin must not receive CloudFront's
+          # Host header, or API Gateway cannot match the request to its API.
           ORIGIN_REQ=$(aws cloudfront list-origin-request-policies --type managed \
             --query "OriginRequestPolicyList.Items[?OriginRequestPolicy.OriginRequestPolicyConfig.Name=='Managed-AllViewerExceptHostHeader'].OriginRequestPolicy.Id | [0]" --output text)
 
@@ -245,7 +233,6 @@ jobs:
                 {
                   "Id": "lambda-api",
                   "DomainName": "${{ needs.preflight.outputs.host }}",
-                  "OriginAccessControlId": "${{ steps.oac.outputs.lambda_id }}",
                   "CustomOriginConfig": {
                     "HTTPPort": 80,
                     "HTTPSPort": 443,
@@ -281,21 +268,78 @@ jobs:
                 "Compress": true
               }]
             },
-            "CustomErrorResponses": {
-              "Quantity": 2,
-              "Items": [
-                { "ErrorCode": 403, "ResponseCode": "200", "ResponsePagePath": "/index.html", "ErrorCachingMinTTL": 0 },
-                { "ErrorCode": 404, "ResponseCode": "200", "ResponsePagePath": "/index.html", "ErrorCachingMinTTL": 0 }
-              ]
-            }
+            "CustomErrorResponses": { "Quantity": 0, "Items": [] }
           }
           JSON
 
           if [ "$DIST_ID" != "None" ] && [ -n "$DIST_ID" ]; then
             echo "updating distribution $DIST_ID"
-            ETAG=$(aws cloudfront get-distribution-config --id "$DIST_ID" --query ETag --output text)
+            # UpdateDistribution demands a COMPLETE DistributionConfig, and a
+            # complete one is larger than it looks: origins carry OriginPath,
+            # CustomHeaders, ConnectionAttempts, OriginShield; behaviours carry
+            # TrustedSigners, GrpcConfig and more. Replacing those objects
+            # wholesale fails with IllegalUpdate ("Aliases are missing",
+            # "OriginCustomHeaders is missing", ...).
+            #
+            # So patch the live config surgically instead: touch only the
+            # fields this workflow owns and leave everything else intact.
+            aws cloudfront get-distribution-config --id "$DIST_ID" > /tmp/current.json
+            ETAG=$(jq -r '.ETag' /tmp/current.json)
+
+            jq --arg s3oac "${{ steps.oac.outputs.id }}" \
+               --arg lhost "${{ needs.preflight.outputs.host }}" \
+               --arg cacheopt "$CACHE_OPT" \
+               --arg cacheoff "$CACHE_OFF" \
+               --arg originreq "$ORIGIN_REQ" \
+               '.DistributionConfig
+            | .Origins.Items = (.Origins.Items | map(
+                if .Id == "s3-site" then .OriginAccessControlId = $s3oac
+                elif .Id == "lambda-api" then (.DomainName = $lhost | del(.OriginAccessControlId))
+                else . end))
+            | (if ([.Origins.Items[].Id] | index("lambda-api")) then . else
+                .Origins.Items += [{
+                  Id: "lambda-api", DomainName: $lhost, OriginPath: "",
+                  CustomHeaders: {Quantity: 0},
+                  CustomOriginConfig: {
+                    HTTPPort: 80, HTTPSPort: 443,
+                    OriginProtocolPolicy: "https-only",
+                    OriginSslProtocols: {Quantity: 1, Items: ["TLSv1.2"]},
+                    OriginReadTimeout: 30, OriginKeepaliveTimeout: 5
+                  },
+                  ConnectionAttempts: 3, ConnectionTimeout: 10,
+                  OriginShield: {Enabled: false}
+                }] end)
+            | .Origins.Quantity = (.Origins.Items | length)
+            | .DefaultCacheBehavior.TargetOriginId = "s3-site"
+            | .DefaultCacheBehavior.CachePolicyId = $cacheopt
+            | .DefaultCacheBehavior.ViewerProtocolPolicy = "redirect-to-https"
+            | .DefaultCacheBehavior.Compress = true
+            | .CacheBehaviors = (.CacheBehaviors // {Quantity: 0, Items: []})
+            | .CacheBehaviors.Items = (.CacheBehaviors.Items // [])
+            | (if ([.CacheBehaviors.Items[]?.PathPattern] | index("/api/*")) then
+                .CacheBehaviors.Items = (.CacheBehaviors.Items | map(
+                  if .PathPattern == "/api/*" then
+                    .TargetOriginId = "lambda-api"
+                    | .CachePolicyId = $cacheoff
+                    | .OriginRequestPolicyId = $originreq
+                    | del(.MinTTL, .MaxTTL, .DefaultTTL, .ForwardedValues)
+                  else . end))
+              else
+                .CacheBehaviors.Items += [(
+                  .DefaultCacheBehavior
+                  + {PathPattern: "/api/*", TargetOriginId: "lambda-api",
+                     CachePolicyId: $cacheoff, OriginRequestPolicyId: $originreq,
+                     AllowedMethods: {Quantity: 7,
+                       Items: ["GET","HEAD","OPTIONS","PUT","POST","PATCH","DELETE"],
+                       CachedMethods: {Quantity: 2, Items: ["GET","HEAD"]}}}
+                )] end)
+            | .CacheBehaviors.Quantity = (.CacheBehaviors.Items | length)
+              | .CustomErrorResponses = {Quantity: 0, Items: []}
+            | .DefaultRootObject = "index.html"
+            | .Enabled = true' /tmp/current.json > /tmp/patched.json
+
             aws cloudfront update-distribution --id "$DIST_ID" \
-              --distribution-config file:///tmp/dist.json --if-match "$ETAG" >/dev/null
+              --distribution-config file:///tmp/patched.json --if-match "$ETAG" >/dev/null
           else
             echo "creating distribution"
             DIST_ID=$(aws cloudfront create-distribution \
@@ -312,22 +356,6 @@ jobs:
           echo "domain=$DOMAIN"   >> "$GITHUB_OUTPUT"
           echo "arn=$ARN"         >> "$GITHUB_OUTPUT"
           echo "url=https://$DOMAIN" >> "$GITHUB_OUTPUT"
-
-      - name: Grant CloudFront permission to invoke the Lambda
-        # Scoped to this distribution's ARN, so only it can reach the Function
-        # URL. Re-applied every run because the statement is idempotent only by
-        # id - remove first, then add.
-        run: |
-          FN="${PROJECT}-api"
-          aws lambda remove-permission --function-name "$FN" \
-            --statement-id AllowCloudFrontInvoke >/dev/null 2>&1 || true
-          aws lambda add-permission --function-name "$FN" \
-            --statement-id AllowCloudFrontInvoke \
-            --action lambda:InvokeFunctionUrl \
-            --principal cloudfront.amazonaws.com \
-            --source-arn "${{ steps.cf.outputs.arn }}" \
-            --function-url-auth-type AWS_IAM >/dev/null
-          echo "CloudFront may now invoke $FN"
 
       - name: Grant CloudFront read access to the bucket
         # Done after the distribution exists, because the policy is scoped to
