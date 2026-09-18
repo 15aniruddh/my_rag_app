@@ -252,6 +252,29 @@ aws iam put-role-policy --role-name pdf-qa-github-actions \
 The `StringLike` condition pins the trust to your repository, so no other repo
 and no fork can assume the role.
 
+> **If the role is rejected with `Not authorized to perform
+> sts:AssumeRoleWithWebIdentity`**, GitHub is probably sending the *immutable
+> identifier* form of the subject claim, which embeds numeric database IDs:
+>
+> ```
+> repo:OWNER@123456/REPO@7890123:environment:production
+> ```
+>
+> rather than the plain `repo:OWNER/REPO:...`. The names alone will not match.
+> Find the exact claim AWS saw:
+>
+> ```bash
+> aws cloudtrail lookup-events \
+>   --lookup-attributes AttributeKey=EventName,AttributeValue=AssumeRoleWithWebIdentity \
+>   --max-results 1 --region <your-region> \
+>   --query 'Events[0].CloudTrailEvent' --output text \
+>   | python3 -c "import sys,json;print(json.load(sys.stdin)['userIdentity']['principalId'])"
+> ```
+>
+> then add that pattern to the trust policy. `StringLike` takes a list, so you
+> can allow both forms. The ID form is in fact the safer one: IDs survive a
+> rename and cannot be reused by someone re-creating a repo with the same name.
+
 ### GitHub secrets and variables
 
 Settings → Secrets and variables → Actions:
@@ -435,5 +458,6 @@ Notes worth knowing:
 | `frontend.yml` fails on "function URL not found" | Run `backend.yml` first; the frontend needs it as a CloudFront origin. |
 | Smoke test times out on the first frontend deploy | A new distribution needs 5-15 minutes to propagate. Check the URL again shortly. |
 | Site returns 403 from CloudFront | The bucket policy step did not run, or the OAC is not attached. Re-run the workflow. |
+| `Not authorized to perform sts:AssumeRoleWithWebIdentity` | The trust policy's `sub` pattern does not match the token. See the note under **One-time AWS setup**. |
 | Build fails: "exceeds Lambda's 250MB limit" | A new dependency pushed the package over. See **The 250MB problem**. |
 | First request after idle is slow | Cold start pulls the 59MB model from S3 into `/tmp`. Subsequent calls are warm. |
