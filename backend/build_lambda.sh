@@ -57,18 +57,31 @@ fi
 echo "==> building the model tarball"
 # Any interpreter with fastembed produces the same cache: the files are plain
 # ONNX and JSON, not platform-specific.
+# Which interpreter can import fastembed depends on where this runs:
+#   CI (linux/x86_64): the wheels just installed into $BUILD import directly.
+#   developer Mac:     those are Linux binaries and will not import, so fall
+#                      back to the project venv.
+# Either way the downloaded files are plain ONNX and JSON, not platform-specific.
 BAKE_PY=""
-for c in ".venv/bin/python" "python3"; do
-  if [ -x "$c" ] || command -v "$c" >/dev/null 2>&1; then
-    if "$c" -c "import fastembed" >/dev/null 2>&1; then BAKE_PY="$c"; break; fi
-  fi
-done
+BAKE_PATH=""
+if PYTHONPATH="$BUILD" python3 -c "import fastembed" >/dev/null 2>&1; then
+  BAKE_PY="python3"; BAKE_PATH="$BUILD"
+  echo "   using the freshly built package"
+elif [ -x ".venv/bin/python" ] && .venv/bin/python -c "import fastembed" >/dev/null 2>&1; then
+  BAKE_PY=".venv/bin/python"
+  echo "   using .venv"
+elif python3 -c "import fastembed" >/dev/null 2>&1; then
+  BAKE_PY="python3"
+  echo "   using system python3"
+fi
+
 if [ -z "$BAKE_PY" ]; then
-  echo "!! no interpreter with fastembed; run 'uv sync' first" >&2
+  echo "!! no interpreter can import fastembed (tried \$BUILD, .venv, python3)" >&2
+  echo "!! run 'uv sync' in backend/ first" >&2
   exit 1
 fi
 
-FASTEMBED_CACHE_PATH="$MODEL_DIR" "$BAKE_PY" -c '
+FASTEMBED_CACHE_PATH="$MODEL_DIR" PYTHONPATH="$BAKE_PATH" "$BAKE_PY" -c '
 from fastembed import TextEmbedding
 list(TextEmbedding().embed(["warm"]))
 print("   model downloaded")
