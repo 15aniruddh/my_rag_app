@@ -1,0 +1,379 @@
+name: Frontend
+
+# Builds the React app, publishes it to a private S3 bucket, and serves it
+# through CloudFront.
+#
+# CloudFront carries two origins:
+#   /       -> S3 (private, reached via Origin Access Control)
+#   /api/*  -> the Lambda Function URL
+#
+# Routing the API through the same distribution makes the browser see one
+# origin, so CORS never applies and VITE_API_BASE stays empty.
+#
+# Idempotent: creates the bucket, OAC and distribution if missing, updates them
+# otherwise.
+
+on:
+  # Runs after Backend succeeds, so a single push that touches both deploys
+  # them in the right order: the frontend needs the Lambda Function URL as a
+  # CloudFront origin.
+  workflow_run:
+    workflows: ["Backend"]
+    types: [completed]
+    branches: [main]
+  push:
+    branches: [main]
+    paths:
+      - 'frontend/**'
+      - '.github/workflows/frontend.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'frontend/**'
+      - '.github/workflows/frontend.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: frontend-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
+  PROJECT: pdf-qa
+  NODE_VERSION: '20'
+
+jobs:
+  check:
+    name: Check
+    # Skipped on workflow_run: that path fires after a backend deploy, where
+    # the frontend source is unchanged and already passed these checks.
+    if: github.event_name != 'workflow_run'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install
+        working-directory: frontend
+        run: npm ci
+
+      - name: Lint
+        working-directory: frontend
+        run: npx oxlint src
+
+      - name: Build
+        working-directory: frontend
+        run: npm run build
+
+  preflight:
+    name: Preflight
+    if: >-
+      github.event_name != 'pull_request' &&
+      (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    outputs:
+      ready: ${{ steps.probe.outputs.ready }}
+      host: ${{ steps.probe.outputs.host }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Is the backend deployed?
+        id: probe
+        run: |
+          URL=$(aws lambda get-function-url-config --function-name "${PROJECT}-api" \
+                  --query FunctionUrl --output text 2>/dev/null || echo "")
+          if [ -z "$URL" ]; then
+            # Not an error: on the very first push the Backend workflow is still
+            # running, and its completion re-triggers this workflow. Skip
+            # quietly rather than failing the run red.
+            echo "::notice::Backend not deployed yet. This run is skipped; it will re-trigger when Backend finishes."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            # CloudFront wants the host only, without scheme or trailing slash.
+            echo "host=$(echo "$URL" | sed -E 's#^https?://##; s#/$##')" >> "$GITHUB_OUTPUT"
+            echo "lambda origin: $URL"
+          fi
+
+  deploy:
+    name: Deploy to S3 + CloudFront
+    needs: [check, preflight]
+    # always() so a skipped 'check' (workflow_run path) does not block the
+    # deploy, while a genuine check FAILURE still does.
+    if: >-
+      always() &&
+      needs.preflight.outputs.ready == 'true' &&
+      needs.check.result != 'failure' &&
+      needs.preflight.result == 'success'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Ensure S3 bucket (private)
+        id: bucket
+        run: |
+          ACCT=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET="${PROJECT}-site-${ACCT}"      # bucket names are globally unique
+          echo "name=$BUCKET" >> "$GITHUB_OUTPUT"
+          echo "acct=$ACCT"   >> "$GITHUB_OUTPUT"
+
+          if ! aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+            echo "creating $BUCKET"
+            if [ "$AWS_REGION" = "us-east-1" ]; then
+              aws s3api create-bucket --bucket "$BUCKET" --region "$AWS_REGION"
+            else
+              aws s3api create-bucket --bucket "$BUCKET" --region "$AWS_REGION" \
+                --create-bucket-configuration "LocationConstraint=${AWS_REGION}"
+            fi
+          fi
+
+          # Private, reached only through CloudFront. This also flips a bucket
+          # left public by an earlier website-hosting deploy.
+          aws s3api put-public-access-block --bucket "$BUCKET" \
+            --public-access-block-configuration \
+            'BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true'
+
+          aws s3api delete-bucket-website --bucket "$BUCKET" 2>/dev/null || true
+
+          aws s3api put-bucket-encryption --bucket "$BUCKET" \
+            --server-side-encryption-configuration \
+            '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+
+      - name: Ensure Origin Access Control
+        id: oac
+        run: |
+          NAME="${PROJECT}-oac"
+          ID=$(aws cloudfront list-origin-access-controls \
+                 --query "OriginAccessControlList.Items[?Name=='${NAME}'].Id | [0]" \
+                 --output text 2>/dev/null || echo "None")
+          if [ "$ID" = "None" ] || [ -z "$ID" ]; then
+            ID=$(aws cloudfront create-origin-access-control \
+              --origin-access-control-config "{
+                \"Name\":\"${NAME}\",
+                \"Description\":\"OAC for ${PROJECT} site bucket\",
+                \"SigningProtocol\":\"sigv4\",
+                \"SigningBehavior\":\"always\",
+                \"OriginAccessControlOriginType\":\"s3\"}" \
+              --query 'OriginAccessControl.Id' --output text)
+          fi
+          echo "id=$ID" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure CloudFront distribution
+        id: cf
+        run: |
+          BUCKET="${{ steps.bucket.outputs.name }}"
+          COMMENT="${PROJECT} site and api"
+
+          # AWS-managed policies, looked up rather than hardcoded so this does
+          # not silently break if the well-known IDs ever change.
+          CACHE_OPT=$(aws cloudfront list-cache-policies --type managed \
+            --query "CachePolicyList.Items[?CachePolicy.CachePolicyConfig.Name=='Managed-CachingOptimized'].CachePolicy.Id | [0]" --output text)
+          CACHE_OFF=$(aws cloudfront list-cache-policies --type managed \
+            --query "CachePolicyList.Items[?CachePolicy.CachePolicyConfig.Name=='Managed-CachingDisabled'].CachePolicy.Id | [0]" --output text)
+          # AllViewerExceptHostHeader: a Function URL rejects requests carrying
+          # CloudFront's Host header, so that one header must not be forwarded.
+          ORIGIN_REQ=$(aws cloudfront list-origin-request-policies --type managed \
+            --query "OriginRequestPolicyList.Items[?OriginRequestPolicy.OriginRequestPolicyConfig.Name=='Managed-AllViewerExceptHostHeader'].OriginRequestPolicy.Id | [0]" --output text)
+
+          DIST_ID=$(aws cloudfront list-distributions \
+            --query "DistributionList.Items[?Comment=='${COMMENT}'].Id | [0]" \
+            --output text 2>/dev/null || echo "None")
+
+          # CallerReference is immutable, so reuse the existing one on update.
+          if [ "$DIST_ID" != "None" ] && [ -n "$DIST_ID" ]; then
+            CALLER=$(aws cloudfront get-distribution-config --id "$DIST_ID" \
+                       --query 'DistributionConfig.CallerReference' --output text)
+          else
+            CALLER="${PROJECT}-$(date +%s)"
+          fi
+
+          cat > /tmp/dist.json <<JSON
+          {
+            "CallerReference": "${CALLER}",
+            "Comment": "${COMMENT}",
+            "Enabled": true,
+            "DefaultRootObject": "index.html",
+            "PriceClass": "PriceClass_100",
+            "Origins": {
+              "Quantity": 2,
+              "Items": [
+                {
+                  "Id": "s3-site",
+                  "DomainName": "${BUCKET}.s3.${AWS_REGION}.amazonaws.com",
+                  "OriginAccessControlId": "${{ steps.oac.outputs.id }}",
+                  "S3OriginConfig": { "OriginAccessIdentity": "" }
+                },
+                {
+                  "Id": "lambda-api",
+                  "DomainName": "${{ needs.preflight.outputs.host }}",
+                  "CustomOriginConfig": {
+                    "HTTPPort": 80,
+                    "HTTPSPort": 443,
+                    "OriginProtocolPolicy": "https-only",
+                    "OriginSslProtocols": { "Quantity": 1, "Items": ["TLSv1.2"] }
+                  }
+                }
+              ]
+            },
+            "DefaultCacheBehavior": {
+              "TargetOriginId": "s3-site",
+              "ViewerProtocolPolicy": "redirect-to-https",
+              "AllowedMethods": {
+                "Quantity": 3, "Items": ["GET","HEAD","OPTIONS"],
+                "CachedMethods": { "Quantity": 2, "Items": ["GET","HEAD"] }
+              },
+              "CachePolicyId": "${CACHE_OPT}",
+              "Compress": true
+            },
+            "CacheBehaviors": {
+              "Quantity": 1,
+              "Items": [{
+                "PathPattern": "/api/*",
+                "TargetOriginId": "lambda-api",
+                "ViewerProtocolPolicy": "redirect-to-https",
+                "AllowedMethods": {
+                  "Quantity": 7,
+                  "Items": ["GET","HEAD","OPTIONS","PUT","POST","PATCH","DELETE"],
+                  "CachedMethods": { "Quantity": 2, "Items": ["GET","HEAD"] }
+                },
+                "CachePolicyId": "${CACHE_OFF}",
+                "OriginRequestPolicyId": "${ORIGIN_REQ}",
+                "Compress": true
+              }]
+            },
+            "CustomErrorResponses": {
+              "Quantity": 2,
+              "Items": [
+                { "ErrorCode": 403, "ResponseCode": "200", "ResponsePagePath": "/index.html", "ErrorCachingMinTTL": 0 },
+                { "ErrorCode": 404, "ResponseCode": "200", "ResponsePagePath": "/index.html", "ErrorCachingMinTTL": 0 }
+              ]
+            }
+          }
+          JSON
+
+          if [ "$DIST_ID" != "None" ] && [ -n "$DIST_ID" ]; then
+            echo "updating distribution $DIST_ID"
+            ETAG=$(aws cloudfront get-distribution-config --id "$DIST_ID" --query ETag --output text)
+            aws cloudfront update-distribution --id "$DIST_ID" \
+              --distribution-config file:///tmp/dist.json --if-match "$ETAG" >/dev/null
+          else
+            echo "creating distribution"
+            DIST_ID=$(aws cloudfront create-distribution \
+              --distribution-config file:///tmp/dist.json \
+              --query 'Distribution.Id' --output text)
+            echo "created $DIST_ID (propagation takes ~5-15 minutes on first deploy)"
+          fi
+
+          DOMAIN=$(aws cloudfront get-distribution --id "$DIST_ID" \
+                     --query 'Distribution.DomainName' --output text)
+          ARN=$(aws cloudfront get-distribution --id "$DIST_ID" \
+                  --query 'Distribution.ARN' --output text)
+          echo "id=$DIST_ID"      >> "$GITHUB_OUTPUT"
+          echo "domain=$DOMAIN"   >> "$GITHUB_OUTPUT"
+          echo "arn=$ARN"         >> "$GITHUB_OUTPUT"
+          echo "url=https://$DOMAIN" >> "$GITHUB_OUTPUT"
+
+      - name: Grant CloudFront read access to the bucket
+        # Done after the distribution exists, because the policy is scoped to
+        # its ARN - only this distribution can read the bucket.
+        run: |
+          aws s3api put-bucket-policy --bucket "${{ steps.bucket.outputs.name }}" --policy "{
+            \"Version\":\"2012-10-17\",
+            \"Statement\":[{
+              \"Sid\":\"AllowCloudFrontRead\",
+              \"Effect\":\"Allow\",
+              \"Principal\":{\"Service\":\"cloudfront.amazonaws.com\"},
+              \"Action\":\"s3:GetObject\",
+              \"Resource\":\"arn:aws:s3:::${{ steps.bucket.outputs.name }}/*\",
+              \"Condition\":{\"StringEquals\":{\"AWS:SourceArn\":\"${{ steps.cf.outputs.arn }}\"}}
+            }]}"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build
+        working-directory: frontend
+        env:
+          # Empty on purpose: CloudFront serves the site and /api/* from one
+          # domain, so the app calls a relative path and CORS never applies.
+          VITE_API_BASE: ''
+          VITE_ACCESS_KEY: ${{ secrets.APP_ACCESS_KEY }}
+          VITE_MODEL_NAME: ${{ vars.GEMINI_MODEL || 'gemini-3.5-flash-lite' }}
+        run: |
+          npm ci
+          npm run build
+
+      - name: Sync to S3
+        run: |
+          BUCKET="${{ steps.bucket.outputs.name }}"
+          # Hashed asset filenames are immutable and can cache forever.
+          aws s3 sync frontend/dist/ "s3://${BUCKET}/" \
+            --delete --exclude index.html \
+            --cache-control "public,max-age=31536000,immutable"
+          # index.html must not be cached, or browsers keep asking for the
+          # previous build's asset names after a deploy.
+          aws s3 cp frontend/dist/index.html "s3://${BUCKET}/index.html" \
+            --cache-control "no-cache,must-revalidate" --content-type "text/html"
+
+      - name: Invalidate CloudFront
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ steps.cf.outputs.id }}" --paths "/*" >/dev/null
+          echo "invalidation requested"
+
+      - name: Smoke test
+        run: |
+          URL="${{ steps.cf.outputs.url }}"
+          echo "testing $URL"
+          # A new distribution can take 15+ minutes to propagate, so this is
+          # patient before it fails.
+          for i in $(seq 1 40); do
+            page=$(curl -s -o /dev/null -w "%{http_code}" --max-time 25 "$URL/" || true)
+            api=$(curl -s -o /dev/null -w "%{http_code}" --max-time 25 "$URL/api/health" || true)
+            echo "  attempt $i: site=$page api=$api"
+            if [ "$page" = "200" ] && [ "$api" = "200" ]; then
+              echo "both origins healthy"
+              curl -s --max-time 25 "$URL/api/health"; echo
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "::warning::Not healthy yet. A first-time distribution can take longer than this job waits; check $URL in a few minutes."
+          exit 1
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Frontend"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Site | ${{ steps.cf.outputs.url }} |"
+            echo "| Distribution | \`${{ steps.cf.outputs.id }}\` |"
+            echo "| Bucket | \`${{ steps.bucket.outputs.name }}\` (private) |"
+            echo "| API | routed through /api/* |"
+          } >> "$GITHUB_STEP_SUMMARY"

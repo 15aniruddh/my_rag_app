@@ -29,8 +29,8 @@ backend/
   vector_db.py       Qdrant wrapper
   custom_types.py    Pydantic models for Inngest steps
   lambda_handler.py  Mangum adapter (handler = lambda_handler.handler)
-  build_lambda.sh    builds the deployment zip
-  requirements.txt   Lambda-only deps (no inngest)
+  build_lambda.sh    builds lambda.zip + model.tar.gz
+  requirements.txt   Lambda-only deps (no inngest, no llama-index)
   pyproject.toml     Python project root; uv.lock beside it
   .venv/             virtual environment (gitignored)
 
@@ -189,48 +189,199 @@ per-IP limits.
 
 ## Deploying to AWS
 
-**Backend → Lambda.** The API-only dependency set is ~163MB unzipped, under
-Lambda's 250MB zip limit, so no container image and no ECR is needed.
+Two GitHub Actions workflows. Pushing to `main` deploys automatically; each one
+only runs when its own directory changed.
+
+| Workflow | Triggered by | Deploys to |
+|---|---|---|
+| `.github/workflows/backend.yml` | `backend/**` | Lambda + Function URL |
+| `.github/workflows/frontend.yml` | `frontend/**` | S3 (private) + CloudFront |
+
+Both are idempotent — they create the buckets, IAM role, Lambda, Function URL,
+Origin Access Control and CloudFront distribution if missing, and update them
+otherwise. There is no separate bootstrap step and no Terraform state to manage.
+
+```
+                    CloudFront (https)
+                   /                  \
+        /  ──> S3 bucket          /api/*  ──> Lambda Function URL
+              (private, OAC)                  (FastAPI via Mangum)
+```
+
+Serving the API through the same distribution means the browser sees **one
+origin**, so CORS never applies and `VITE_API_BASE` stays empty.
+
+### One-time AWS setup
+
+The pipeline authenticates with **OIDC**, so no long-lived AWS keys are stored
+anywhere. Create the identity provider and role once:
+
+```bash
+ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+REPO="<your-github-user>/<your-repo>"
+
+aws iam create-open-id-connect-provider \
+  --url https://token.actions.githubusercontent.com \
+  --client-id-list sts.amazonaws.com \
+  --thumbprint-list 6938fd4d98bab03faadb97b34396831e3780aea1
+
+aws iam create-role --role-name pdf-qa-github-actions \
+  --assume-role-policy-document "{
+    \"Version\":\"2012-10-17\",
+    \"Statement\":[{
+      \"Effect\":\"Allow\",
+      \"Principal\":{\"Federated\":\"arn:aws:iam::${ACCOUNT}:oidc-provider/token.actions.githubusercontent.com\"},
+      \"Action\":\"sts:AssumeRoleWithWebIdentity\",
+      \"Condition\":{
+        \"StringEquals\":{\"token.actions.githubusercontent.com:aud\":\"sts.amazonaws.com\"},
+        \"StringLike\":{\"token.actions.githubusercontent.com:sub\":\"repo:${REPO}:*\"}
+      }}]}"
+
+aws iam attach-role-policy --role-name pdf-qa-github-actions \
+  --policy-arn arn:aws:iam::aws:policy/PowerUserAccess
+
+# PowerUser cannot manage IAM, and the workflow creates the Lambda's role.
+aws iam put-role-policy --role-name pdf-qa-github-actions \
+  --policy-name manage-lambda-role --policy-document '{
+    "Version":"2012-10-17",
+    "Statement":[{"Effect":"Allow","Action":[
+      "iam:CreateRole","iam:GetRole","iam:PassRole",
+      "iam:AttachRolePolicy","iam:PutRolePolicy"],"Resource":"*"}]}'
+```
+
+The `StringLike` condition pins the trust to your repository, so no other repo
+and no fork can assume the role.
+
+### GitHub secrets and variables
+
+Settings → Secrets and variables → Actions:
+
+| Secret | Value |
+|---|---|
+| `AWS_ROLE_ARN` | `arn:aws:iam::<account>:role/pdf-qa-github-actions` |
+| `QDRANT_URL` | from your `.env` |
+| `QDRANT_API_KEY` | from your `.env` |
+| `GEMINI_API_KEY` | from your `.env` |
+| `APP_ACCESS_KEY` | optional; gates the public API |
+
+| Variable | Default |
+|---|---|
+| `AWS_REGION` | `ap-south-1` |
+| `GEMINI_MODEL` | `gemini-3.5-flash-lite` |
+| `DAILY_QUERY_BUDGET` | `200` |
+
+With the `gh` CLI:
+
+```bash
+gh secret set AWS_ROLE_ARN   --body "arn:aws:iam::<account>:role/pdf-qa-github-actions"
+gh secret set QDRANT_URL     --body "$(grep ^QDRANT_URL .env     | cut -d= -f2- | tr -d '\"')"
+gh secret set QDRANT_API_KEY --body "$(grep ^QDRANT_API_KEY .env | cut -d= -f2- | tr -d '\"')"
+gh secret set GEMINI_API_KEY --body "$(grep ^GEMINI_API_KEY .env | cut -d= -f2- | tr -d '\"')"
+```
+
+### Ordering is automatic
+
+`frontend.yml` needs the Lambda Function URL as a CloudFront origin, so the
+backend must deploy first. That is handled for you:
+
+```
+push to main
+   |
+   +--> Backend   (backend/** changed)  -> Lambda + Function URL
+   |        |
+   |        +-- on success, triggers ------> Frontend -> S3 + CloudFront
+   |
+   +--> Frontend  (frontend/** changed) -> runs directly
+```
+
+`frontend.yml` listens for `workflow_run` on **Backend**, and a `preflight` job
+checks whether the Lambda exists. If it does not, the run is **skipped with a
+notice rather than failing** — the backend's completion re-triggers it moments
+later. So a single push that touches both directories deploys them in the right
+order with no red runs and nothing manual.
+
+A frontend-only change still deploys straight away via the `push` trigger,
+without waiting on the backend.
+
+> On the very first push, GitHub occasionally does not fire `workflow_run` for a
+> workflow it has just registered. If the frontend does not start on its own
+> after the backend finishes, run it once by hand:
+> `gh workflow run frontend.yml`. Every push after that chains normally.
+
+### The 250MB problem
+
+Lambda's zip limit is **250MB unzipped**. This app does not fit naively:
+
+| | Size |
+|---|---|
+| Dependencies with `llama-index` | 384 MB |
+| After replacing it with `pypdf` | 214 MB |
+| Embedding model | 65 MB |
+
+Two changes make it fit:
+
+1. **`pypdf` instead of `llama-index`** — llama-index dragged in pandas,
+   sqlalchemy, nltk and aiohttp for what is text extraction plus a splitter.
+   `data_loader.py` now does both directly.
+2. **The model is not in the zip.** `build_lambda.sh` produces `lambda.zip`
+   (188MB unzipped) and `model.tar.gz` (59MB) separately. The model is stored in
+   S3, and `data_loader._ensure_model_cache()` pulls it into `/tmp` on the first
+   call in a container. Warm invocations skip it.
+
+`PIL` (21MB) and `grpc` (18MB) look removable but are not: fastembed imports PIL
+even for text models, and qdrant-client loads 20 grpc modules on the REST path.
+Both were checked rather than assumed.
+
+Build locally to check the size before pushing:
 
 ```bash
 cd backend && ./build_lambda.sh
 ```
 
-Create the function:
+It fails the build if the package exceeds 250MB, so the limit is caught on your
+machine rather than at deploy time.
 
-- Runtime **Python 3.13**, handler **`lambda_handler.handler`**
-- Upload `lambda.zip` (via S3 if over 50MB)
-- Memory **1024MB**, timeout **60s**
-- Env vars: the five from `.env`, plus
-  `FASTEMBED_CACHE_PATH=/var/task/model_cache`,
-  `ALLOWED_ORIGINS=https://<your-cloudfront-domain>`, and `TRUST_PROXY=1`
-- Enable a **Function URL** — not API Gateway, whose free tier is 12 months
-  while Lambda's 1M requests/month is perpetual
+### Frontend hosting
 
-`build_lambda.sh` pulls `manylinux2014_x86_64` wheels (onnxruntime ships native
-binaries, so macOS wheels would not run) and bakes the 720KB quantized
-embedding model into the package, so cold starts never call HuggingFace.
-Measured warm-up: ~0.35s.
+`frontend.yml` publishes the build to a **private** S3 bucket and serves it
+through CloudFront. The bucket blocks all public access; only the distribution
+can read it, via an Origin Access Control policy scoped to that distribution's
+ARN.
 
-**Frontend → S3 + CloudFront.**
+The distribution carries two origins:
 
-```bash
-cd frontend && npm run build
-aws s3 sync dist/ s3://<your-bucket>/ --delete
-```
+| Path | Origin | Caching |
+|---|---|---|
+| `/*` | S3 bucket | `Managed-CachingOptimized` |
+| `/api/*` | Lambda Function URL | `Managed-CachingDisabled` |
 
-Serve the bucket through CloudFront and add a second origin routing `/api/*` to
-the Function URL. That keeps the site same-origin, so `VITE_API_BASE` stays
-empty and CORS stays out of it. Otherwise point `VITE_API_BASE` at the Function
-URL and set `ALLOWED_ORIGINS` on the Lambda.
+`/api/*` also uses the `Managed-AllViewerExceptHostHeader` origin request
+policy. That detail matters: a Lambda Function URL **rejects requests carrying
+CloudFront's `Host` header**, so that one header must not be forwarded.
+
+`403` and `404` both return `/index.html` with a `200`, so client-side routes
+resolve instead of hitting an S3 error.
+
+Assets are uploaded with `max-age=31536000,immutable` because their filenames
+are content-hashed; `index.html` is uploaded `no-cache` so browsers pick up new
+asset names immediately. Every deploy invalidates `/*`.
+
+> **First deploy is slow.** A new distribution takes roughly 5-15 minutes to
+> propagate. The smoke test waits ~13 minutes and then warns rather than
+> failing silently — if it times out, the site is usually fine a few minutes
+> later. Subsequent deploys are quick.
+
+The Function URL stays publicly reachable, so the API can be called directly,
+bypassing CloudFront. Rate limiting is enforced in the application, so it still
+applies. `backend.yml` sets `ALLOWED_ORIGINS` to the CloudFront domain for that
+case; it is empty on the very first run, before the distribution exists.
 
 ### Cost
 
-Lambda's free tier is perpetual. S3's 5GB is 12 months, after which a small
-static site is cents per month. Qdrant and Gemini free tiers cover this
-workload. Realistically under $1/month after year one, not $0.
-
----
+Lambda's free tier (1M requests + 400k GB-seconds/month) is perpetual, as is
+CloudFront's (1TB out + 10M requests/month). S3's 5GB is 12 months, after which
+the site and artefacts cost cents. Qdrant and Gemini free tiers cover this
+workload.
 
 ## How it works
 
@@ -281,3 +432,8 @@ Notes worth knowing:
 | Inngest dashboard shows no events | Expected — the React UI does not send events. Trigger one manually. |
 | Lambda times out on first call | Cold start plus model load. Timeout 60s, memory 1024MB. |
 | Code changes have no effect | uvicorn without `--reload` keeps old modules in memory. Restart it. |
+| `frontend.yml` fails on "function URL not found" | Run `backend.yml` first; the frontend needs it as a CloudFront origin. |
+| Smoke test times out on the first frontend deploy | A new distribution needs 5-15 minutes to propagate. Check the URL again shortly. |
+| Site returns 403 from CloudFront | The bucket policy step did not run, or the OAC is not attached. Re-run the workflow. |
+| Build fails: "exceeds Lambda's 250MB limit" | A new dependency pushed the package over. See **The 250MB problem**. |
+| First request after idle is slow | Cold start pulls the 59MB model from S3 into `/tmp`. Subsequent calls are warm. |

@@ -1,0 +1,277 @@
+name: Backend
+
+# Deploys the FastAPI app to AWS Lambda as a zip.
+#
+# Two artefacts: lambda.zip (~188MB unzipped, under the 250MB limit) and
+# model.tar.gz (the 65MB embedding model, too large to ship inside the zip).
+# Both are staged in S3; the function pulls the model into /tmp on cold start.
+#
+# The job is idempotent: it creates the artifacts bucket, IAM role, Lambda
+# function and Function URL if missing, and updates them otherwise.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'backend/**'
+      - '.github/workflows/backend.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'backend/**'
+      - '.github/workflows/backend.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write   # OIDC: no long-lived AWS keys are stored
+
+concurrency:
+  group: backend-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
+  PROJECT: pdf-qa
+  PYTHON_VERSION: '3.13'
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Compile all modules
+        working-directory: backend
+        run: |
+          python -m compileall -q api.py rag.py limits.py data_loader.py \
+            vector_db.py custom_types.py lambda_handler.py main.py
+          echo "all modules compile"
+
+      - name: Build the package
+        working-directory: backend
+        # Running the real build on PRs catches a dependency that pushes the
+        # package over Lambda's 250MB limit before it reaches main.
+        run: |
+          pip install --quiet uv
+          ./build_lambda.sh
+
+  deploy:
+    name: Deploy to Lambda
+    needs: check
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: production
+    outputs:
+      function_url: ${{ steps.url.outputs.function_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Ensure artifacts bucket
+        id: bucket
+        run: |
+          ACCT=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET="${PROJECT}-artifacts-${ACCT}"
+          echo "name=$BUCKET" >> "$GITHUB_OUTPUT"
+
+          if ! aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+            if [ "$AWS_REGION" = "us-east-1" ]; then
+              aws s3api create-bucket --bucket "$BUCKET" --region "$AWS_REGION"
+            else
+              aws s3api create-bucket --bucket "$BUCKET" --region "$AWS_REGION" \
+                --create-bucket-configuration "LocationConstraint=${AWS_REGION}"
+            fi
+          fi
+          # Private: these are deployment artefacts, not public downloads.
+          aws s3api put-public-access-block --bucket "$BUCKET" \
+            --public-access-block-configuration \
+            'BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Build package and model
+        working-directory: backend
+        run: |
+          pip install --quiet uv
+          ./build_lambda.sh
+          ls -lh lambda.zip model.tar.gz
+
+      - name: Upload artefacts to S3
+        id: upload
+        run: |
+          BUCKET="${{ steps.bucket.outputs.name }}"
+          # The SHA in the key means each deploy is traceable and the previous
+          # package stays available for rollback.
+          aws s3 cp backend/lambda.zip "s3://${BUCKET}/lambda/${{ github.sha }}.zip"
+          echo "key=lambda/${{ github.sha }}.zip" >> "$GITHUB_OUTPUT"
+
+          # The model rarely changes, so upload it only when absent - it is
+          # 59MB and re-uploading on every deploy wastes minutes.
+          if aws s3api head-object --bucket "$BUCKET" --key "model/model.tar.gz" >/dev/null 2>&1; then
+            echo "model already in S3"
+          else
+            aws s3 cp backend/model.tar.gz "s3://${BUCKET}/model/model.tar.gz"
+          fi
+
+      - name: Ensure IAM role
+        id: iam
+        run: |
+          ROLE="${PROJECT}-lambda-role"
+          if ! aws iam get-role --role-name "$ROLE" >/dev/null 2>&1; then
+            aws iam create-role --role-name "$ROLE" --assume-role-policy-document '{
+              "Version":"2012-10-17",
+              "Statement":[{"Effect":"Allow",
+                "Principal":{"Service":"lambda.amazonaws.com"},
+                "Action":"sts:AssumeRole"}]}' >/dev/null
+            # Logs only: the function reaches Qdrant and Gemini over the
+            # internet and needs no other AWS permissions.
+            aws iam attach-role-policy --role-name "$ROLE" \
+              --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+            echo "waiting for IAM propagation"
+            sleep 15
+          fi
+
+          # Read-only access to the model object, scoped to that one key.
+          aws iam put-role-policy --role-name "$ROLE" --policy-name model-read \
+            --policy-document "{
+              \"Version\":\"2012-10-17\",
+              \"Statement\":[{
+                \"Effect\":\"Allow\",
+                \"Action\":\"s3:GetObject\",
+                \"Resource\":\"arn:aws:s3:::${{ steps.bucket.outputs.name }}/model/*\"
+              }]}"
+          echo "arn=$(aws iam get-role --role-name "$ROLE" --query 'Role.Arn' --output text)" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve site origin for CORS
+        id: origin
+        run: |
+          # The site is served through CloudFront, and /api/* is routed through
+          # the same distribution - so browser traffic is same-origin and CORS
+          # never fires. This is only for callers hitting the Function URL
+          # directly. Empty on the very first deploy, when the distribution
+          # does not exist yet; the frontend workflow creates it.
+          DOMAIN=$(aws cloudfront list-distributions \
+            --query "DistributionList.Items[?Comment=='${PROJECT} site and api'].DomainName | [0]" \
+            --output text 2>/dev/null || echo "None")
+          if [ "$DOMAIN" = "None" ] || [ -z "$DOMAIN" ]; then
+            echo "no distribution yet; leaving ALLOWED_ORIGINS empty"
+            echo "allowed=" >> "$GITHUB_OUTPUT"
+          else
+            echo "allowed=https://${DOMAIN}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Deploy function
+        env:
+          QDRANT_URL: ${{ secrets.QDRANT_URL }}
+          QDRANT_API_KEY: ${{ secrets.QDRANT_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-3.5-flash-lite' }}
+          APP_ACCESS_KEY: ${{ secrets.APP_ACCESS_KEY }}
+          DAILY_QUERY_BUDGET: ${{ vars.DAILY_QUERY_BUDGET || '200' }}
+        run: |
+          FN="${PROJECT}-api"
+          BUCKET="${{ steps.bucket.outputs.name }}"
+          KEY="${{ steps.upload.outputs.key }}"
+
+          # Environment is written from a file so secrets never appear in the
+          # process list or the job log.
+          cat > /tmp/env.json <<JSON
+          {"Variables":{
+            "QDRANT_URL":"${QDRANT_URL}",
+            "QDRANT_API_KEY":"${QDRANT_API_KEY}",
+            "GEMINI_API_KEY":"${GEMINI_API_KEY}",
+            "GEMINI_ENDPOINT":"https://generativelanguage.googleapis.com/v1beta/openai",
+            "GEMINI_MODEL":"${GEMINI_MODEL}",
+            "APP_ACCESS_KEY":"${APP_ACCESS_KEY}",
+            "MODEL_S3_BUCKET":"${{ steps.bucket.outputs.name }}",
+            "MODEL_S3_KEY":"model/model.tar.gz",
+            "FASTEMBED_CACHE_PATH":"/tmp/model_cache",
+            "TRUST_PROXY":"1",
+            "ALLOWED_ORIGINS":"${{ steps.origin.outputs.allowed }}",
+            "DAILY_QUERY_BUDGET":"${DAILY_QUERY_BUDGET}"
+          }}
+          JSON
+
+          if aws lambda get-function --function-name "$FN" >/dev/null 2>&1; then
+            echo "updating existing function"
+            aws lambda update-function-code --function-name "$FN" \
+              --s3-bucket "$BUCKET" --s3-key "$KEY" >/dev/null
+            aws lambda wait function-updated --function-name "$FN"
+            aws lambda update-function-configuration --function-name "$FN" \
+              --memory-size 1024 --timeout 60 \
+              --environment file:///tmp/env.json >/dev/null
+          else
+            echo "creating function"
+            aws lambda create-function --function-name "$FN" \
+              --runtime python3.13 --handler lambda_handler.handler \
+              --code "S3Bucket=${BUCKET},S3Key=${KEY}" \
+              --role "${{ steps.iam.outputs.arn }}" \
+              --memory-size 1024 --timeout 60 \
+              --environment file:///tmp/env.json >/dev/null
+          fi
+          aws lambda wait function-updated --function-name "$FN"
+          rm -f /tmp/env.json
+
+          # 14-day retention: CloudWatch logs are not free forever.
+          aws logs put-retention-policy --log-group-name "/aws/lambda/${FN}" \
+            --retention-in-days 14 2>/dev/null || true
+
+      - name: Ensure Function URL
+        id: url
+        run: |
+          FN="${PROJECT}-api"
+          aws lambda get-function-url-config --function-name "$FN" >/dev/null 2>&1 || {
+            aws lambda create-function-url-config --function-name "$FN" \
+              --auth-type NONE >/dev/null
+            # Without this the URL returns 403: the URL itself is not enough,
+            # the function policy must allow public invocation.
+            aws lambda add-permission --function-name "$FN" \
+              --statement-id FunctionURLAllowPublicAccess \
+              --action lambda:InvokeFunctionUrl \
+              --principal '*' --function-url-auth-type NONE >/dev/null
+          }
+          URL=$(aws lambda get-function-url-config --function-name "$FN" \
+                  --query FunctionUrl --output text)
+          echo "function_url=$URL" >> "$GITHUB_OUTPUT"
+          echo "function url: $URL"
+
+      - name: Smoke test
+        run: |
+          URL="${{ steps.url.outputs.function_url }}"
+          for i in $(seq 1 20); do
+            code=$(curl -s -o /tmp/health.json -w "%{http_code}" --max-time 30 "${URL}api/health" || true)
+            if [ "$code" = "200" ]; then
+              echo "healthy:"; cat /tmp/health.json; echo; exit 0
+            fi
+            echo "  attempt $i: $code"
+            sleep 15
+          done
+          echo "never became healthy; recent logs:"
+          aws logs tail "/aws/lambda/${PROJECT}-api" --since 10m || true
+          exit 1
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Backend"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Function URL | ${{ steps.url.outputs.function_url }} |"
+            echo "| Package | \`${{ steps.upload.outputs.key }}\` |"
+            echo "| Region | \`${{ env.AWS_REGION }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

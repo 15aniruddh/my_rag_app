@@ -19,6 +19,8 @@ frontend/dist/
 
 # Lambda build artefacts
 backend/.lambda_build/
+backend/.model_cache/
 backend/lambda.zip
+backend/model.tar.gz
 
 # note: bare ".venv" matches at any depth, so backend/.venv is covered
