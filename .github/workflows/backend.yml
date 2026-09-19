@@ -102,6 +102,17 @@ jobs:
             --public-access-block-configuration \
             'BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true'
 
+          # Staged PDFs are deleted by the ingest workflow's last step; this
+          # rule is the backstop for runs that never got that far.
+          aws s3api put-bucket-lifecycle-configuration --bucket "$BUCKET" \
+            --lifecycle-configuration '{
+              "Rules":[{
+                "ID":"expire-staged-uploads",
+                "Status":"Enabled",
+                "Filter":{"Prefix":"uploads/"},
+                "Expiration":{"Days":1}
+              }]}'
+
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ env.PYTHON_VERSION }}
@@ -158,6 +169,10 @@ jobs:
                 \"Effect\":\"Allow\",
                 \"Action\":\"s3:GetObject\",
                 \"Resource\":\"arn:aws:s3:::${{ steps.bucket.outputs.name }}/model/*\"
+              },{
+                \"Effect\":\"Allow\",
+                \"Action\":[\"s3:GetObject\",\"s3:PutObject\",\"s3:DeleteObject\"],
+                \"Resource\":\"arn:aws:s3:::${{ steps.bucket.outputs.name }}/uploads/*\"
               }]}"
           echo "arn=$(aws iam get-role --role-name "$ROLE" --query 'Role.Arn' --output text)" >> "$GITHUB_OUTPUT"
 
@@ -186,6 +201,8 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-3.5-flash-lite' }}
           APP_ACCESS_KEY: ${{ secrets.APP_ACCESS_KEY }}
+          INNGEST_SIGNING_KEY: ${{ secrets.INNGEST_SIGNING_KEY }}
+          INNGEST_EVENT_KEY: ${{ secrets.INNGEST_EVENT_KEY }}
           DAILY_QUERY_BUDGET: ${{ vars.DAILY_QUERY_BUDGET || '200' }}
         run: |
           FN="${PROJECT}-api"
@@ -202,7 +219,10 @@ jobs:
             "GEMINI_ENDPOINT":"https://generativelanguage.googleapis.com/v1beta/openai",
             "GEMINI_MODEL":"${GEMINI_MODEL}",
             "APP_ACCESS_KEY":"${APP_ACCESS_KEY}",
+            "INNGEST_SIGNING_KEY":"${INNGEST_SIGNING_KEY}",
+            "INNGEST_EVENT_KEY":"${INNGEST_EVENT_KEY}",
             "MODEL_S3_BUCKET":"${{ steps.bucket.outputs.name }}",
+            "UPLOAD_S3_BUCKET":"${{ steps.bucket.outputs.name }}",
             "MODEL_S3_KEY":"model/model.tar.gz",
             "FASTEMBED_CACHE_PATH":"/tmp/model_cache",
             "TRUST_PROXY":"1",

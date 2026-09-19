@@ -3,7 +3,8 @@
 Endpoints:
   GET  /api/health   - liveness
   GET  /api/library  - chunk count and indexed document names
-  POST /api/ingest   - multipart PDF upload, chunk + embed + store
+  POST /api/ingest   - multipart PDF upload; hands off to Inngest when the
+                       durable path is configured, otherwise ingests inline
   POST /api/query    - question in, answer + sources out
 """
 
@@ -11,12 +12,15 @@ import os
 import tempfile
 from pathlib import Path
 
+import inngest
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 import limits
 import rag
+import uploads
+from main import inngest_client
 
 app = FastAPI(title="PDF Q&A API")
 
@@ -88,14 +92,31 @@ async def ingest(file: UploadFile = File(...)) -> dict:
             detail=f"PDF is {len(payload) // 1024}KB; limit is {MAX_UPLOAD_BYTES // 1024}KB.",
         )
 
+    name = Path(file.filename).name
+
+    # Durable path: stage the bytes in S3 and hand off to Inngest. Needs both
+    # the bucket and an event key; with either missing we ingest inline, which
+    # is what local development does.
+    if uploads.enabled() and os.getenv("INNGEST_EVENT_KEY"):
+        try:
+            key = uploads.put(payload, name)
+            await inngest_client.send(
+                inngest.Event(name="rag/ingest_pdf", data={"s3_key": key, "source_id": name})
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Could not queue ingestion: {exc}") from exc
+        # No chunk count: the work has not run yet. The client polls
+        # /api/library until the name appears.
+        return {"queued": True, "source": name}
+
     # Lambda's only writable location is /tmp, which gettempdir() resolves to.
     tmp_dir = Path(tempfile.gettempdir()) / "rag_uploads"
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    tmp_path = tmp_dir / Path(file.filename).name
+    tmp_path = tmp_dir / name
     tmp_path.write_bytes(payload)
 
     try:
-        ingested = rag.ingest_pdf(str(tmp_path), Path(file.filename).name)
+        ingested = rag.ingest_pdf(str(tmp_path), name)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Ingestion failed: {exc}") from exc
     finally:
@@ -104,7 +125,7 @@ async def ingest(file: UploadFile = File(...)) -> dict:
 
     if ingested == 0:
         raise HTTPException(status_code=422, detail="No extractable text found in that PDF.")
-    return {"ingested": ingested, "source": Path(file.filename).name}
+    return {"ingested": ingested, "source": name}
 
 
 @app.post(

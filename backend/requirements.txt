@@ -1,8 +1,11 @@
-# Lambda deployment deps: the REST API only.
+# Lambda deployment deps.
 #
-# Excludes inngest (the local durable path, never runs on Lambda) and
-# llama-index (replaced by pypdf: it pulled ~170MB of pandas/sqlalchemy/nltk
-# for text extraction alone, and the Lambda zip limit is 250MB unzipped).
+# inngest is included: the durable path is served from lambda_handler.py so
+# Inngest Cloud can reach it at /api/inngest on the same API Gateway.
+#
+# Excludes llama-index (replaced by pypdf: it pulled ~170MB of
+# pandas/sqlalchemy/nltk for text extraction alone, and the Lambda zip limit
+# is 250MB unzipped).
 #
 # boto3 is NOT listed: the Lambda runtime provides it, and packaging it would
 # waste ~50MB of the budget.
@@ -14,3 +17,4 @@ requests>=2.27
 qdrant-client>=1.19.0
 fastembed>=0.7.0
 pypdf>=6.15.0
+inngest>=0.5.19

@@ -103,8 +103,10 @@ dev and CORS never applies — the same code path as production.
 
 ### Optional: the Inngest path
 
-Durable retries, step memoization, and a run dashboard. Not needed for normal
-use, and the React UI does not send events to it.
+Durable retries, step memoization, and a run dashboard. Optional: with the
+Inngest secrets unset, `/api/ingest` chunks and embeds inline and nothing below
+applies. Locally the React UI never sends events; on AWS it does, once
+`INNGEST_SIGNING_KEY` and `INNGEST_EVENT_KEY` are set (see *Durable ingest*).
 
 ```bash
 # 1. dev server (dashboard on :8288)
@@ -125,6 +127,25 @@ curl -X POST http://localhost:8288/e/dev_key \
 The dashboard shows "No events found" until something sends an event. That is
 expected, not a fault.
 
+### Durable ingest (AWS)
+
+Set `INNGEST_SIGNING_KEY` and `INNGEST_EVENT_KEY` as repo secrets and sync the
+app in Inngest Cloud against `https://<your-domain>/api/inngest`. `/api/ingest`
+then stages the PDF in S3, emits `rag/ingest_pdf` and returns
+`{queued: true, source}` immediately; the frontend polls `/api/library` until
+the name lands.
+
+S3 is not incidental. Lambda's `/tmp` belongs to one container, so a PDF
+written while handling the upload is gone by the time Inngest calls back for a
+step — that callback is a separate invocation. The bytes are staged under
+`uploads/` in the artifacts bucket, downloaded *inside* the step so a retry in
+a fresh container still works, and deleted by the final step. A lifecycle rule
+expires anything left behind after a day.
+
+Unset either secret and the whole path is skipped: `/api/ingest` embeds inline
+and returns a chunk count, exactly as it did before. That is what local
+development uses, and why `uploads.py` is a no-op there.
+
 ---
 
 ## API
@@ -133,7 +154,7 @@ expected, not a fault.
 |---|---|---|---|
 | GET | `/api/health` | — | `{status, budget}` — open, never rate limited |
 | GET | `/api/library` | — | `{chunks, documents[]}` |
-| POST | `/api/ingest` | multipart `file` | `{ingested, source}` |
+| POST | `/api/ingest` | multipart `file` | `{ingested, source}`, or `{queued, source}` on the durable path |
 | POST | `/api/query` | `{question, top_k?}` | `{answer, sources[], num_contexts}` |
 | DELETE | `/api/documents/{source}` | — | `{deleted}` |
 | DELETE | `/api/documents` | — | `{cleared}` |
@@ -287,6 +308,8 @@ Settings → Secrets and variables → Actions:
 | `QDRANT_API_KEY` | from your `.env` |
 | `GEMINI_API_KEY` | from your `.env` |
 | `APP_ACCESS_KEY` | optional; gates the public API |
+| `INNGEST_SIGNING_KEY` | optional; turns on the durable ingest path |
+| `INNGEST_EVENT_KEY` | optional; required alongside the signing key |
 
 | Variable | Default |
 |---|---|
@@ -470,7 +493,9 @@ Notes worth knowing:
 | `507 Library is full` | `MAX_DOCUMENTS` / `MAX_CHUNKS` hit. Delete a document. |
 | CORS error in the browser | `VITE_API_BASE` is off-origin without `ALLOWED_ORIGINS` set on the backend. |
 | `127.0.0.1:5173` refuses to connect | Vite binds IPv6-only. Use `localhost:5173`. |
-| Inngest dashboard shows no events | Expected — the React UI does not send events. Trigger one manually. |
+| Inngest dashboard shows no events | Locally, expected — trigger one manually. On AWS, check both Inngest secrets are set. |
+| Upload says "still indexing" and stops | The run failed. Open the Inngest dashboard; the staged PDF expires from `uploads/` after a day. |
+| `502 Could not queue ingestion` | The function cannot reach S3 or Inngest. Check the `model-read` role policy covers `uploads/*`. |
 | Lambda times out on first call | Cold start plus model load. Timeout 60s, memory 1024MB. |
 | Code changes have no effect | uvicorn without `--reload` keeps old modules in memory. Restart it. |
 | `frontend.yml` fails on "function URL not found" | Run `backend.yml` first; the frontend needs it as a CloudFront origin. |

@@ -32,7 +32,7 @@ else
     --python-version 3.13 --only-binary=:all: -r requirements.txt
 fi
 
-cp api.py rag.py limits.py data_loader.py vector_db.py custom_types.py lambda_handler.py "$BUILD/"
+cp api.py rag.py limits.py data_loader.py vector_db.py custom_types.py lambda_handler.py main.py uploads.py "$BUILD/"
 
 echo "==> building the model tarball"
 # Done BEFORE trimming, against the pristine install: the import test needs the

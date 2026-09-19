@@ -37,6 +37,23 @@ export function uploadPdf(file) {
   return fetch(`${BASE}/api/ingest`, { method: 'POST', body: form, headers: authHeaders }).then(unwrap)
 }
 
+// The durable ingest path answers before the work has run, so the UI waits for
+// the name to appear in the library rather than trusting the upload response.
+// Resolves with the library once it lands, or null if the deadline passes.
+export async function waitForDocument(source, timeoutMs = 90_000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 2000))
+    try {
+      const lib = await getLibrary()
+      if (lib.documents.includes(source)) return lib
+    } catch {
+      // A blip mid-poll is not fatal; keep trying until the deadline.
+    }
+  }
+  return null
+}
+
 // encodeURIComponent matters: filenames routinely contain spaces.
 export const deleteDocument = (source) =>
   fetch(`${BASE}/api/documents/${encodeURIComponent(source)}`, {

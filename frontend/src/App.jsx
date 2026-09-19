@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import Markdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { askQuestion, clearLibrary, deleteDocument, getLibrary, uploadPdf } from './api'
+import { askQuestion, clearLibrary, deleteDocument, getLibrary, uploadPdf, waitForDocument } from './api'
 
 const MODEL = import.meta.env.VITE_MODEL_NAME ?? 'gemini-3.5-flash-lite'
 
@@ -186,7 +186,18 @@ export default function App() {
     setUploadNote(null)
     try {
       const res = await uploadPdf(file)
-      setUploadNote({ text: `Indexed ${res.source} · ${res.ingested} chunks` })
+      if (res.queued) {
+        // Durable path: the chunk count does not exist yet, so poll instead.
+        setUploadNote({ text: `Queued ${res.source} · indexing…` })
+        const done = await waitForDocument(res.source)
+        setUploadNote({
+          text: done
+            ? `Indexed ${res.source}`
+            : `${res.source} is still indexing — it will appear shortly.`,
+        })
+      } else {
+        setUploadNote({ text: `Indexed ${res.source} · ${res.ingested} chunks` })
+      }
       await refreshLibrary()
     } catch (err) {
       setUploadNote({ text: err.message, error: true })
