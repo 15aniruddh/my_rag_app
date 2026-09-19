@@ -326,6 +326,42 @@ jobs:
           aws logs tail "/aws/lambda/${PROJECT}-api" --since 10m 2>/dev/null || echo "(no log group)"
           exit 1
 
+      - name: Sync app with Inngest
+        env:
+          INNGEST_SIGNING_KEY: ${{ secrets.INNGEST_SIGNING_KEY }}
+          PUBLIC_BASE_URL: ${{ vars.PUBLIC_BASE_URL }}
+          SITE_ORIGIN: ${{ steps.origin.outputs.allowed }}
+          API_ENDPOINT: ${{ steps.url.outputs.function_url }}
+        run: |
+          # Without this, a deploy that changes the functions leaves Inngest
+          # pointing at the old registration - or, on a fresh account, at
+          # nothing at all, in which case uploads queue and silently never run.
+          if [ -z "$INNGEST_SIGNING_KEY" ]; then
+            echo "no signing key: durable path is off, nothing to sync"
+            exit 0
+          fi
+
+          # Inngest calls this URL back for every step, so it has to be the one
+          # the public reaches. PUBLIC_BASE_URL wins when set (a custom domain),
+          # then the CloudFront domain; the raw API Gateway endpoint is only
+          # reached on the first deploy, before the distribution exists.
+          BASE="${PUBLIC_BASE_URL:-${SITE_ORIGIN:-$API_ENDPOINT}}"
+          echo "syncing ${BASE}/api/inngest"
+
+          for i in $(seq 1 5); do
+            code=$(curl -s -o /tmp/sync.json -w "%{http_code}" --max-time 60 \
+                     -X PUT "${BASE}/api/inngest" || true)
+            if [ "$code" = "200" ]; then
+              echo "synced:"; cat /tmp/sync.json; echo
+              exit 0
+            fi
+            echo "  attempt $i: $code $(head -c 200 /tmp/sync.json 2>/dev/null)"
+            sleep 10
+          done
+
+          echo "::error::Inngest sync failed - uploads would queue but never run"
+          exit 1
+
       - name: Summary
         if: always()
         run: |
@@ -337,4 +373,5 @@ jobs:
             echo "| API endpoint | ${{ steps.url.outputs.function_url }} |"
             echo "| Package | \`${{ steps.upload.outputs.key }}\` |"
             echo "| Region | \`${{ env.AWS_REGION }}\` |"
+            echo "| Inngest | ${{ vars.PUBLIC_BASE_URL || steps.origin.outputs.allowed }}/api/inngest |"
           } >> "$GITHUB_STEP_SUMMARY"

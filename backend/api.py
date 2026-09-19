@@ -8,13 +8,17 @@ Endpoints:
   POST /api/query    - question in, answer + sources out
 """
 
+import logging
 import os
 import tempfile
 from pathlib import Path
 
 import inngest
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from pydantic import BaseModel, Field
 
 import limits
@@ -34,6 +38,64 @@ app.add_middleware(
 )
 
 MAX_UPLOAD_BYTES = 6 * 1024 * 1024  # Lambda Function URLs cap payloads near 6MB
+
+logger = logging.getLogger("rag")
+
+
+async def _report(request: Request, status: int, detail: str) -> None:
+    """Record a server-side failure: CloudWatch always, Inngest when configured.
+
+    The log line is the one that must never fail - it is the only record of a
+    failure nobody was watching. The event is what puts it on the dashboard
+    next to the ingest runs, and it deliberately triggers no function: it is a
+    log entry, not work, so "Functions triggered: -" against
+    rag/request_failed is correct rather than a missing sync.
+    """
+    if not os.getenv("INNGEST_EVENT_KEY"):
+        return
+    try:
+        await inngest_client.send(
+            inngest.Event(
+                name="rag/request_failed",
+                data={
+                    "path": request.url.path,
+                    "method": request.method,
+                    "status": status,
+                    # Bounded: an error string is not a place to put a payload.
+                    "detail": detail[:1000],
+                },
+            )
+        )
+    except Exception:
+        # Telemetry must never make an already-failing request worse.
+        logger.warning("could not report failure to Inngest", exc_info=True)
+
+
+@app.exception_handler(StarletteHTTPException)
+async def _log_http_error(request: Request, exc: StarletteHTTPException):
+    """Every handler converts its failure into an HTTPException, so logging
+    here covers all of them - including ones added later - instead of repeating
+    a log call in each except block. 4xx stays quiet: that is a caller being
+    told no, not the service breaking.
+    """
+    if exc.status_code >= 500:
+        logger.error(
+            "%s %s -> %s: %s", request.method, request.url.path, exc.status_code, exc.detail,
+            # `raise ... from exc` keeps the original; that traceback is the
+            # part worth having.
+            exc_info=exc.__cause__ or exc,
+        )
+        await _report(request, exc.status_code, str(exc.detail))
+    return await http_exception_handler(request, exc)
+
+
+@app.exception_handler(Exception)
+async def _log_unhandled(request: Request, exc: Exception):
+    """A bug outside any try block - the failure mode nobody plans for."""
+    logger.exception("unhandled error on %s %s", request.method, request.url.path)
+    await _report(request, 500, repr(exc))
+    # Deliberately generic: an unplanned traceback is not for the caller.
+    return JSONResponse(status_code=500, content={"detail": "Internal server error."})
 
 
 class QueryIn(BaseModel):

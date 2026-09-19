@@ -146,6 +146,23 @@ Unset either secret and the whole path is skipped: `/api/ingest` embeds inline
 and returns a chunk count, exactly as it did before. That is what local
 development uses, and why `uploads.py` is a no-op there.
 
+### When something fails
+
+Any 5xx is logged once, centrally, by an exception handler in `api.py` rather
+than by a log call in each `except` block — so routes added later are covered
+for free. The traceback logged is the *original* cause, not the `HTTPException`
+wrapping it. 4xx stays quiet: that is a caller being told no.
+
+With `INNGEST_EVENT_KEY` set, the same handler also emits `rag/request_failed`
+carrying the path, method, status and (truncated) detail, so a failure that
+happened to a stranger at 3am shows up on the dashboard next to the ingest
+runs instead of only in that person's browser.
+
+`rag/request_failed` triggers no function on purpose — it is a log entry, not
+work. `Functions triggered: —` against it is correct, not a missing sync.
+Sending it is best-effort: if Inngest is unreachable the request still returns
+its original error, and the CloudWatch line is still written.
+
 ---
 
 ## API
@@ -314,6 +331,7 @@ Settings → Secrets and variables → Actions:
 | Variable | Default |
 |---|---|
 | `AWS_REGION` | `ap-south-1` |
+| `PUBLIC_BASE_URL` | the CloudFront domain; set it to your custom domain so the Inngest sync registers that URL |
 | `GEMINI_MODEL` | `gemini-3.5-flash-lite` |
 | `DAILY_QUERY_BUDGET` | `200` |
 
@@ -496,6 +514,7 @@ Notes worth knowing:
 | Inngest dashboard shows no events | Locally, expected — trigger one manually. On AWS, check both Inngest secrets are set. |
 | Upload says "still indexing" and stops | The run failed. Open the Inngest dashboard; the staged PDF expires from `uploads/` after a day. |
 | `502 Could not queue ingestion` | The function cannot reach S3 or Inngest. Check the `model-read` role policy covers `uploads/*`. |
+| A query failed but you only heard from a user | `aws logs tail /aws/lambda/rag-app-api --since 1h`, or filter `rag/request_failed` on the Inngest dashboard. |
 | Lambda times out on first call | Cold start plus model load. Timeout 60s, memory 1024MB. |
 | Code changes have no effect | uvicorn without `--reload` keeps old modules in memory. Restart it. |
 | `frontend.yml` fails on "function URL not found" | Run `backend.yml` first; the frontend needs it as a CloudFront origin. |

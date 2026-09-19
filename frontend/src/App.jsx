@@ -190,11 +190,12 @@ export default function App() {
         // Durable path: the chunk count does not exist yet, so poll instead.
         setUploadNote({ text: `Queued ${res.source} · indexing…` })
         const done = await waitForDocument(res.source)
-        setUploadNote({
-          text: done
-            ? `Indexed ${res.source}`
-            : `${res.source} is still indexing — it will appear shortly.`,
-        })
+        // Not "still indexing": by now the run has almost certainly failed, and
+        // saying it will turn up shortly sends people away from the one place
+        // that shows why it did not.
+        setUploadNote(done
+          ? { text: `Indexed ${res.source}` }
+          : { text: `${res.source} did not finish indexing. The upload was accepted but the job did not complete — check the Inngest dashboard for the failed run.`, error: true })
       } else {
         setUploadNote({ text: `Indexed ${res.source} · ${res.ingested} chunks` })
       }
